@@ -208,6 +208,9 @@ void FusionROS::imageCallback(const sensor_msgs::ImageConstPtr &imagemsg) {
     } else if (imagemsg->encoding == sensor_msgs::image_encodings::BGR8) {
         image = Mat(static_cast<int>(imagemsg->height), static_cast<int>(imagemsg->width), CV_8UC3);
         memcpy(image.data, imagemsg->data.data(), imagemsg->height * imagemsg->width * 3);
+    } else if (imagemsg->encoding == sensor_msgs::image_encodings::RGB8) {
+        image = Mat(static_cast<int>(imagemsg->height), static_cast<int>(imagemsg->width), CV_8UC3);
+        memcpy(image.data, imagemsg->data.data(), imagemsg->height * imagemsg->width * 3);
     }
 
     // Time convertion
