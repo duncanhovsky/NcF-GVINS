@@ -22,6 +22,8 @@
 
 #include "preintegration/preintegration_base.h"
 
+#include <algorithm>
+
 PreintegrationBase::PreintegrationBase(std::shared_ptr<IntegrationParameters> parameters, const IMU &imu0,
                                        IntegrationState state)
     : parameters_(std::move(parameters))
@@ -32,6 +34,7 @@ PreintegrationBase::PreintegrationBase(std::shared_ptr<IntegrationParameters> pa
 
     imu_buffer_.clear();
     imu_buffer_.push_back(imu0);
+    interval_noise_scale_ = std::max(imu0.noise_scale, 1.0);
 
     gravity_ = Vector3d(0, 0, parameters_->gravity);
 }
@@ -71,11 +74,13 @@ void PreintegrationBase::integration(const IMU &imu_pre, const IMU &imu_cur) {
 
 void PreintegrationBase::addNewImu(const IMU &imu) {
     imu_buffer_.push_back(imu);
+    interval_noise_scale_ = std::max(interval_noise_scale_, std::max(imu.noise_scale, 1.0));
     integrationProcess(imu_buffer_.size() - 1);
 }
 
 void PreintegrationBase::reintegration(IntegrationState &state) {
     current_state_ = std::move(state);
+    interval_noise_scale_ = imu_buffer_.empty() ? 1.0 : std::max(imu_buffer_.front().noise_scale, 1.0);
     resetState(current_state_);
 
     for (size_t k = 1; k < imu_buffer_.size(); k++) {

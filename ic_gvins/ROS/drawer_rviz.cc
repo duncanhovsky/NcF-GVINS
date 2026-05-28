@@ -30,12 +30,15 @@
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/image_encodings.h>
 
-DrawerRviz::DrawerRviz(ros::NodeHandle &nh)
+DrawerRviz::DrawerRviz(ros::NodeHandle &nh, const string &frame_id)
     : isfinished_(false)
     , isframerdy_(false)
     , ismaprdy_(false) {
 
-    frame_id_ = "world";
+    // NC-IC extension: when enabled by the caller this output is explicitly
+    // the smooth online odom track; the asynchronous node separately publishes
+    // globally corrected map output.  "world" remains the IC baseline default.
+    frame_id_ = frame_id;
 
     pose_pub_           = nh.advertise<nav_msgs::Odometry>("pose", 2);
     path_pub_           = nh.advertise<nav_msgs::Path>("path", 2);

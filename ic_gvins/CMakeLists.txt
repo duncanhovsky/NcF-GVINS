@@ -61,12 +61,27 @@ target_link_libraries(ic_gvins_core
 
 # ROS interface
 find_package(catkin REQUIRED COMPONENTS
+        geometry_msgs
         message_generation
+        nav_msgs
         roscpp
+        sensor_msgs
+        std_msgs
+        tf2_ros)
+
+# NC-IC extension: the asynchronous relocation node receives optimized online
+# snapshots and unbiased GNSS anchors through an explicit ROS boundary.
+add_message_files(
+        FILES
+        RecoveryFrame.msg
+        RecoveryEvent.msg)
+generate_messages(
+        DEPENDENCIES
+        geometry_msgs
         std_msgs)
 catkin_package(
         LIBRARIES
-        CATKIN_DEPENDS roscpp std_msgs)
+        CATKIN_DEPENDS geometry_msgs message_runtime nav_msgs roscpp sensor_msgs std_msgs tf2_ros)
 include_directories(
         ${catkin_INCLUDE_DIRS})
 
@@ -75,7 +90,16 @@ add_executable(${PROJECT_NAME}_ros
         ROS/fusion_ros.cc
         ROS/drawer_rviz.cc)
 
-        add_dependencies(${PROJECT_NAME}_ros ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(${PROJECT_NAME}_ros ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(${PROJECT_NAME}_ros
         ${catkin_LIBRARIES}
         ic_gvins_core)
+
+# NC-IC extension: a loop-node-like asynchronous map correction process.
+# It is separated from ic_gvins_ros so map correction never blocks online odom.
+add_executable(${PROJECT_NAME}_reloc_node
+        ROS/degraded_reloc_node.cc)
+add_dependencies(${PROJECT_NAME}_reloc_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_reloc_node
+        ${catkin_LIBRARIES}
+        ${CERES_LIBRARIES})

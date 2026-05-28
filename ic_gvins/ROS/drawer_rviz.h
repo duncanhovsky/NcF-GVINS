@@ -39,7 +39,7 @@ using std::vector;
 class DrawerRviz : public Drawer {
 
 public:
-    explicit DrawerRviz(ros::NodeHandle &nh);
+    explicit DrawerRviz(ros::NodeHandle &nh, const string &frame_id = "world");
 
     void run() override;
 

@@ -1,0 +1,99 @@
+# NcF-GVINS configuration for KAIST urban38 using the left stereo camera as a
+# monocular input.
+# Source reference:
+#   ncgmvins_ws/src/VINS-Fusion/config/KAIST/kaist_urban38_config.yaml
+
+outputpath: "~/kaist_urban38/NcF-GVINS"
+is_make_outputdir: true
+
+sensor_profile:
+    dataset: "KAIST urban38"
+    camera_type: "mono pinhole from stereo left camera"
+    image_rate: 30
+    imu_rate: 100
+    gnss_rate: 10
+    magnetic_rate: 15
+    source_vins_noise:
+        acc_n: 0.02
+        gyr_n: 0.003
+        acc_w: 0.005
+        gyr_w: 3.0e-5
+
+initlength: 1
+imudatarate: 100
+iswithearth: true
+
+antlever: [0.0, 0.0, 0.0]
+
+imumodel:
+    arw: 0.3
+    vrw: 0.3
+    gbstd: 100.0
+    abstd: 100.0
+    corrtime: 1.0
+
+isusegnssoutage: false
+gnssoutagetime: 0
+gnssoutageendtime: 0
+gnssthreshold: 15
+
+nc_extension:
+    enabled: true
+    enable_async_relocator: true
+    gnss_recovery_confirm_samples: 3
+    horizontal_recovery_confirm_samples: 3
+    vertical_recovery_confirm_samples: 5
+    horizontal_recovery_confirm_duration: 0.5
+    vertical_recovery_confirm_duration: 1.0
+    # KAIST urban38 reference config has 10 Hz GNSS.
+    gnss_timeout: 0.5
+    gnss_horizontal_innovation_threshold: 15.0
+    gnss_vertical_innovation_threshold: 30.0
+    recovery_min_horizontal_baseline: 8.0
+    recovery_max_yaw_deg: 20.0
+    startup_mode: "auto"
+    enable_local_bootstrap: true
+    local_static_duration: 1.0
+    global_alignment_min_baseline: 8.0
+    enable_earth_handover: false
+    enable_height_bias: false
+    height_bias_random_walk_std: 0.05
+    height_bias_prior_std: 20.0
+    use_magnetic_heading: false
+    heading_topic: "/imu/mag"
+    heading_max_sync_interval: 0.05
+    heading_innovation_threshold_deg: 20.0
+    heading_recovery_confirm_samples: 3
+    heading_degraded_covariance_scale: 10.0
+    visual_min_residuals: 20
+    visual_max_outlier_ratio: 0.5
+    vision_degrade_confirm_frames: 2
+    vision_recovery_confirm_frames: 3
+    vision_degraded_covariance_scale: 5.0
+    imu_recovery_confirm_intervals: 5
+    imu_degraded_covariance_scale: 25.0
+    imu_max_angular_rate: 0.0
+    imu_max_specific_force: 0.0
+
+is_use_visualization: true
+
+track_check_histogram: false
+track_min_parallax: 15
+track_max_interval: 0.35
+track_max_features: 200
+
+reprojection_error_std: 1.5
+optimize_windows_size: 10
+optimize_num_iterations: 20
+optimize_estimate_extrinsic: false
+optimize_estimate_td: true
+
+cam0:
+    intrinsic: [816.9037899277, 811.5680382849, 608.5072628169, 263.4759976444]
+    distortion: [-0.0561430278, 0.1395256320, -0.0012155907, -0.0009728139]
+    resolution: [1280, 560]
+
+    # body_T_cam0 from kaist_urban38_config.yaml converted to q_b_c/t_b_c.
+    q_b_c: [-0.502042960, 0.505585657, -0.497783109, 0.494517933]
+    t_b_c: [1.71239, 0.247401, -0.11589]
+    td_b_c: 0.0

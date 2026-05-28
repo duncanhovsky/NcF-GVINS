@@ -1,0 +1,112 @@
+# NcF-GVINS configuration for i2Nav-Robot building00.
+# Source reference:
+#   ncgmvins_ws/src/VINS-Fusion/config/i2Nav/building00.yaml
+#
+# Notes:
+# - NcF-GVINS currently uses one monocular camera. This file uses the i2Nav
+#   left AVT camera.
+# - ROS topics are selected by launch file parameters, not by this YAML.
+# - VINS-Fusion IMU noise fields are kept in sensor_profile for traceability;
+#   imumodel below uses the IC-GVINS arw/vrw/bias convention.
+
+outputpath: "~/building00/NcF-GVINS"
+is_make_outputdir: true
+
+sensor_profile:
+    dataset: "i2Nav-Robot building00"
+    camera_type: "mono pinhole, AVT left camera"
+    image_rate: 10
+    imu_rate: 200
+    gnss_rate: 10
+    magnetic_rate: 0
+    source_vins_noise:
+        acc_n: 0.1
+        gyr_n: 0.0064
+        acc_w: 0.1
+        gyr_w: 0.0064
+    source_gnss_std_hint: 0.49
+
+initlength: 1
+imudatarate: 200
+iswithearth: true
+
+# GNSS antenna lever arm in IMU body frame, front-right-down, from i2Nav config.
+antlever: [0.0, -0.07, -0.365]
+
+imumodel:
+    # ADIS16465-class startup values in IC-GVINS units.
+    arw: 0.1        # deg/sqrt(hr)
+    vrw: 0.1        # m/s/sqrt(hr)
+    gbstd: 50.0     # deg/hr
+    abstd: 50.0     # mGal
+    corrtime: 1.0   # hr
+
+isusegnssoutage: false
+gnssoutagetime: 0
+gnssoutageendtime: 0
+gnssthreshold: 10
+
+nc_extension:
+    enabled: true
+    enable_async_relocator: true
+    gnss_recovery_confirm_samples: 3
+    horizontal_recovery_confirm_samples: 3
+    vertical_recovery_confirm_samples: 5
+    horizontal_recovery_confirm_duration: 0.5
+    vertical_recovery_confirm_duration: 1.0
+    # i2Nav GNSS is configured as 10 Hz. This is a configured silence timeout,
+    # not online rate estimation.
+    gnss_timeout: 0.5
+    gnss_horizontal_innovation_threshold: 10.0
+    gnss_vertical_innovation_threshold: 20.0
+    recovery_min_horizontal_baseline: 5.0
+    recovery_max_yaw_deg: 20.0
+    startup_mode: "auto"
+    enable_local_bootstrap: true
+    local_static_duration: 1.0
+    global_alignment_min_baseline: 5.0
+    enable_earth_handover: false
+    enable_height_bias: false
+    height_bias_random_walk_std: 0.05
+    height_bias_prior_std: 20.0
+    use_magnetic_heading: false
+    heading_topic: "/mag_heading"
+    heading_max_sync_interval: 0.05
+    heading_innovation_threshold_deg: 20.0
+    heading_recovery_confirm_samples: 3
+    heading_degraded_covariance_scale: 10.0
+    visual_min_residuals: 20
+    visual_max_outlier_ratio: 0.5
+    vision_degrade_confirm_frames: 2
+    vision_recovery_confirm_frames: 3
+    vision_degraded_covariance_scale: 5.0
+    imu_recovery_confirm_intervals: 5
+    imu_degraded_covariance_scale: 25.0
+    imu_max_angular_rate: 0.0
+    imu_max_specific_force: 0.0
+
+is_use_visualization: true
+
+track_check_histogram: false
+track_min_parallax: 15
+track_max_interval: 0.5
+track_max_features: 500
+
+reprojection_error_std: 1.5
+optimize_windows_size: 10
+optimize_num_iterations: 20
+optimize_estimate_extrinsic: true
+optimize_estimate_td: false
+
+cam0:
+    intrinsic: [1064.8950, 1065.2546, 801.4049, 624.6878]
+    distortion: [-0.1516, 0.0942, 0.000169, -0.000142, -0.0229]
+    resolution: [1600, 1200]
+
+    # body_T_cam0 from VINS-Fusion converted to q_b_c/t_b_c.
+    # Pb = q_b_c * Pc + t_b_c, q order is x, y, z, w.
+    q_b_c: [0.501597048, 0.497367045, 0.499880050, 0.501145048]
+    t_b_c: [0.1, -0.2, -0.054]
+
+    # VINS-Fusion td: image clock + td = IMU clock.
+    td_b_c: 0.02

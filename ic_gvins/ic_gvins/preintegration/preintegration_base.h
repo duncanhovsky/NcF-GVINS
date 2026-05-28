@@ -129,6 +129,10 @@ protected:
     Eigen::MatrixXd jacobian_, covariance_;
     Eigen::MatrixXd noise_;
     Eigen::MatrixXd sqrt_information_;
+    // NC-IC extension: an IMU interval diagnosed as suspect still carries
+    // time propagation, but its factor covariance is enlarged so other
+    // healthy modalities can influence the solution.
+    double interval_noise_scale_{1.0};
 
     Quaterniond corrected_q_;
     Vector3d corrected_p_, corrected_v_;

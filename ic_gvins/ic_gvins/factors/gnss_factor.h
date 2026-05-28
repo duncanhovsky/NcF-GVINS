@@ -40,6 +40,10 @@ public:
         gnss_ = gnss;
     }
 
+    int activeDof() const {
+        return (gnss_.horizontal_valid ? 2 : 0) + (gnss_.vertical_valid ? 1 : 0);
+    }
+
     bool Evaluate(const double *const *parameters, double *residuals, double **jacobians) const override {
         Vector3d p{parameters[0][0], parameters[0][1], parameters[0][2]};
         Quaterniond q{parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]};
@@ -49,9 +53,16 @@ public:
         error = p + q.toRotationMatrix() * lever_ - gnss_.blh;
 
         Matrix3d sqrt_info_ = Matrix3d::Zero();
-        sqrt_info_(0, 0)    = 1.0 / gnss_.std[0];
-        sqrt_info_(1, 1)    = 1.0 / gnss_.std[1];
-        sqrt_info_(2, 2)    = 1.0 / gnss_.std[2];
+        // NC-IC extension: original IC-GVINS admitted or rejected the whole
+        // 3-D GNSS point.  Independent axis admission keeps useful horizontal
+        // information when only GNSS height is degraded by multipath.
+        if (gnss_.horizontal_valid) {
+            sqrt_info_(0, 0) = 1.0 / gnss_.std[0];
+            sqrt_info_(1, 1) = 1.0 / gnss_.std[1];
+        }
+        if (gnss_.vertical_valid) {
+            sqrt_info_(2, 2) = 1.0 / gnss_.std[2];
+        }
 
         error = sqrt_info_ * error;
 

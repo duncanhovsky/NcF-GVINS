@@ -29,9 +29,12 @@
 #include "common/logging.h"
 
 #include "factors/gnss_factor.h"
+#include "factors/heading_factor.h"
+#include "factors/height_bias_factor.h"
 #include "factors/marginalization_factor.h"
 #include "factors/marginalization_info.h"
 #include "factors/pose_parameterization.h"
+#include "factors/recovery_gnss_factor.h"
 #include "factors/reprojection_factor.h"
 #include "factors/residual_block_info.h"
 #include "preintegration/imu_error_factor.h"
@@ -42,6 +45,10 @@
 
 #include <ceres/ceres.h>
 #include <yaml-cpp/yaml.h>
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
 
 GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr drawer) {
     gvinsstate_ = GVINS_ERROR;
@@ -97,6 +104,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     integration_parameters_->gravity      = NORMAL_GRAVITY;
 
     integration_config_.iswithearth = config["iswithearth"].as<bool>();
+    configured_with_earth_          = integration_config_.iswithearth;
     integration_config_.isuseodo    = false;
     integration_config_.iswithscale = false;
     integration_config_.gravity     = {0, 0, integration_parameters_->gravity};
@@ -136,6 +144,143 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     optimize_num_iterations_     = config["optimize_num_iterations"].as<int>();
     optimize_windows_size_       = config["optimize_windows_size"].as<size_t>();
 
+    // NC-IC extension: all new behaviour is configuration-gated so an
+    // unmodified IC-GVINS run remains available as a regression baseline.
+    if (config["nc_extension"]) {
+        const auto nc_config = config["nc_extension"];
+        nc_extension_enabled_ = nc_config["enabled"] ? nc_config["enabled"].as<bool>() : false;
+
+        SensorHealthManager::Options health_options;
+        health_options.enabled = nc_extension_enabled_;
+        if (nc_config["gnss_recovery_confirm_samples"]) {
+            health_options.horizontal_recovery_confirm_samples =
+                nc_config["gnss_recovery_confirm_samples"].as<int>();
+        }
+        if (nc_config["horizontal_recovery_confirm_samples"]) {
+            health_options.horizontal_recovery_confirm_samples =
+                nc_config["horizontal_recovery_confirm_samples"].as<int>();
+        }
+        if (nc_config["vertical_recovery_confirm_samples"]) {
+            health_options.vertical_recovery_confirm_samples =
+                nc_config["vertical_recovery_confirm_samples"].as<int>();
+        }
+        if (nc_config["horizontal_recovery_confirm_duration"]) {
+            health_options.horizontal_recovery_confirm_duration =
+                nc_config["horizontal_recovery_confirm_duration"].as<double>();
+        }
+        if (nc_config["vertical_recovery_confirm_duration"]) {
+            health_options.vertical_recovery_confirm_duration =
+                nc_config["vertical_recovery_confirm_duration"].as<double>();
+        }
+        if (nc_config["vision_degrade_confirm_frames"]) {
+            health_options.vision_degrade_confirm_frames =
+                nc_config["vision_degrade_confirm_frames"].as<int>();
+        }
+        if (nc_config["vision_recovery_confirm_frames"]) {
+            health_options.vision_recovery_confirm_frames =
+                nc_config["vision_recovery_confirm_frames"].as<int>();
+        }
+        if (nc_config["vision_degraded_covariance_scale"]) {
+            health_options.vision_degraded_covariance_scale =
+                nc_config["vision_degraded_covariance_scale"].as<double>();
+        }
+        if (nc_config["heading_recovery_confirm_samples"]) {
+            health_options.heading_recovery_confirm_samples =
+                nc_config["heading_recovery_confirm_samples"].as<int>();
+        }
+        if (nc_config["heading_degraded_covariance_scale"]) {
+            health_options.heading_degraded_covariance_scale =
+                nc_config["heading_degraded_covariance_scale"].as<double>();
+        }
+        if (nc_config["imu_recovery_confirm_intervals"]) {
+            health_options.imu_recovery_confirm_intervals =
+                nc_config["imu_recovery_confirm_intervals"].as<int>();
+        }
+        if (nc_config["imu_degraded_covariance_scale"]) {
+            health_options.imu_degraded_covariance_scale =
+                nc_config["imu_degraded_covariance_scale"].as<double>();
+        }
+        gnss_health_manager_ = SensorHealthManager(health_options);
+
+        if (nc_config["gnss_timeout"]) {
+            gnss_timeout_ = nc_config["gnss_timeout"].as<double>();
+        }
+        if (nc_config["gnss_horizontal_innovation_threshold"]) {
+            gnss_horizontal_innovation_threshold_ =
+                nc_config["gnss_horizontal_innovation_threshold"].as<double>();
+        }
+        if (nc_config["gnss_vertical_innovation_threshold"]) {
+            gnss_vertical_innovation_threshold_ =
+                nc_config["gnss_vertical_innovation_threshold"].as<double>();
+        }
+        if (nc_config["recovery_min_horizontal_baseline"]) {
+            recovery_min_horizontal_baseline_ =
+                nc_config["recovery_min_horizontal_baseline"].as<double>();
+        } else if (nc_config["global_alignment_min_baseline"]) {
+            recovery_min_horizontal_baseline_ =
+                nc_config["global_alignment_min_baseline"].as<double>();
+        }
+        if (nc_config["recovery_max_yaw_deg"]) {
+            recovery_max_yaw_ = nc_config["recovery_max_yaw_deg"].as<double>() * D2R;
+        }
+        enable_local_bootstrap_ =
+            nc_config["enable_local_bootstrap"] ? nc_config["enable_local_bootstrap"].as<bool>() : false;
+        if (nc_config["startup_mode"]) {
+            force_local_startup_ = nc_config["startup_mode"].as<string>() == "local_static";
+        }
+        enable_height_bias_ =
+            nc_config["enable_height_bias"] ? nc_config["enable_height_bias"].as<bool>() : false;
+        if (nc_config["height_bias_random_walk_std"]) {
+            height_bias_random_walk_std_ = nc_config["height_bias_random_walk_std"].as<double>();
+        }
+        if (nc_config["height_bias_prior_std"]) {
+            height_bias_prior_std_ = nc_config["height_bias_prior_std"].as<double>();
+        }
+        use_magnetic_heading_ =
+            nc_config["use_magnetic_heading"] ? nc_config["use_magnetic_heading"].as<bool>() : false;
+        if (nc_config["heading_max_sync_interval"]) {
+            heading_max_sync_interval_ = nc_config["heading_max_sync_interval"].as<double>();
+        }
+        if (nc_config["heading_innovation_threshold_deg"]) {
+            heading_innovation_threshold_ =
+                nc_config["heading_innovation_threshold_deg"].as<double>() * D2R;
+        }
+        if (nc_config["visual_min_residuals"]) {
+            visual_min_residuals_ = nc_config["visual_min_residuals"].as<int>();
+        }
+        if (nc_config["visual_max_outlier_ratio"]) {
+            visual_max_outlier_ratio_ = nc_config["visual_max_outlier_ratio"].as<double>();
+        }
+        if (nc_config["imu_max_angular_rate"]) {
+            imu_max_angular_rate_ = nc_config["imu_max_angular_rate"].as<double>();
+        }
+        if (nc_config["imu_max_specific_force"]) {
+            imu_max_specific_force_ = nc_config["imu_max_specific_force"].as<double>();
+        }
+        if (enable_local_bootstrap_) {
+            LocalInitializer::Options local_options;
+            local_options.imu_rate = imudatarate_;
+            local_options.gravity = integration_parameters_->gravity;
+            if (nc_config["local_static_duration"]) {
+                local_options.static_duration = nc_config["local_static_duration"].as<double>();
+            }
+            local_initializer_.reset(new LocalInitializer(local_options));
+        }
+        if (nc_config["enable_earth_handover"] &&
+            nc_config["enable_earth_handover"].as<bool>()) {
+            // NC-IC extension: switching a live arbitrary-yaw local window to
+            // NED Earth preintegration would require transforming all active
+            // poses, landmarks and the marginalization prior.  Keep this
+            // unsupported instead of silently mixing incompatible factors.
+            LOGW << "NC-IC cannot directly hand over a live local window to Earth mode; "
+                    "global alignment remains represented by map_to_odom";
+        }
+        LOGI << "NC-IC GNSS health/recovery extension is " << (nc_extension_enabled_ ? "enabled" : "disabled");
+        LOGI << "NC-IC local bootstrap is " << (enable_local_bootstrap_ ? "enabled" : "disabled")
+             << ", height bias is " << (enable_height_bias_ ? "enabled" : "disabled")
+             << ", magnetic heading is " << (use_magnetic_heading_ ? "enabled" : "disabled");
+    }
+
     // 归一化相机坐标系下
     // Reprojection std
     optimize_reprojection_error_std_ = reprojection_error_std_ / camera_->focalLength();
@@ -166,20 +311,54 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     gvinsstate_ = GVINS_INITIALIZING;
 }
 
-bool GVINS::addNewImu(const IMU &imu) {
-    if (imu_buffer_mutex_.try_lock()) {
-        if (imu.dt > (imudatadt_ * 1.5)) {
-            LOGE << absl::StrFormat("Lost IMU data with at %0.3lf dt %0.3lf", imu.time, imu.dt);
+void GVINS::setRecoveryFrameCallback(RecoveryFrameCallback callback) {
+    std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+    recovery_frame_callback_ = std::move(callback);
+}
 
-            long cnts = lround(imu.dt / imudatadt_) - 1;
+void GVINS::setRecoveryEventCallback(RecoveryEventCallback callback) {
+    std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+    recovery_event_callback_ = std::move(callback);
+}
+
+bool GVINS::addNewImu(const IMU &input) {
+    IMU imu = input;
+    if (imu_buffer_mutex_.try_lock()) {
+        const bool finite = std::isfinite(imu.time) && std::isfinite(imu.dt) &&
+                            imu.dtheta.allFinite() && imu.dvel.allFinite();
+        if (!finite || imu.dt <= 0.0) {
+            LOGE << "NC-IC rejects non-finite or non-positive-time IMU packet";
+            imu_buffer_mutex_.unlock();
+            return true;
+        }
+
+        const bool has_gap = imu.dt > (imudatadt_ * 1.5);
+        const double angular_rate = imu.dtheta.norm() / imu.dt;
+        const double specific_force = imu.dvel.norm() / imu.dt;
+        const bool amplitude_valid =
+            (imu_max_angular_rate_ <= 0.0 || angular_rate <= imu_max_angular_rate_) &&
+            (imu_max_specific_force_ <= 0.0 || specific_force <= imu_max_specific_force_);
+        {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            const auto decision =
+                gnss_health_manager_.updateImu(imu.time, !has_gap && amplitude_valid,
+                                                has_gap ? imu.dt : std::max(angular_rate, specific_force));
+            imu.health_state = decision.health.state;
+            imu.noise_scale = decision.covariance_scale;
+        }
+        if (has_gap) {
+            LOGW << absl::StrFormat("NC-IC splits suspect IMU gap at %0.3lf dt %0.3lf", imu.time, imu.dt);
+
+            const long cnts = std::max<long>(1, lround(imu.dt / imudatadt_));
 
             IMU imudata  = imu;
             imudata.time = imu.time - imu.dt;
-            while (cnts--) {
-                imudata.time += imudatadt_;
-                imudata.dt = imudatadt_;
+            imudata.dt = imu.dt / static_cast<double>(cnts);
+            imudata.dtheta = imu.dtheta / static_cast<double>(cnts);
+            imudata.dvel = imu.dvel / static_cast<double>(cnts);
+            for (long k = 0; k < cnts; k++) {
+                imudata.time += imudata.dt;
                 imu_buffer_.push(imudata);
-                LOGE << "Append extra IMU data at " << Logging::doubleData(imudata.time);
             }
         } else {
             imu_buffer_.push(imu);
@@ -199,27 +378,543 @@ bool GVINS::addNewImu(const IMU &imu) {
 bool GVINS::addNewGnss(const GNSS &gnss) {
     // 低频观测, 无需加锁
 
+    // NC-IC extension: keep the geodetic input untouched.  Original
+    // IC-GVINS overwrote its only GNSS value with local NED, which made it
+    // impossible for an asynchronous global correction node to distinguish
+    // unbiased raw GNSS from an online recovery-adjusted measurement.
+    GNSS observation = gnss;
+    observation.raw_blh = gnss.blh;
+
+    if (nc_extension_enabled_ && force_local_startup_ && !local_bootstrap_active_) {
+        // NC-IC extension: an explicit local-static startup request prevents
+        // an early GNSS packet from selecting the original IC initializer
+        // before the requested local odom gauge is established.
+        return true;
+    }
+
+    std::lock_guard<std::mutex> buffer_lock(gnss_buffer_mutex_);
+
     // 根据GNSS定位更新重力常量
     // Update the gravity from GNSS
     if (integration_config_.origin.isZero()) {
+        const bool origin_observation_valid =
+            observation.quality_valid && !observation.forced_degraded &&
+            (local_bootstrap_active_ || observation.vertical_valid);
+        if (nc_extension_enabled_ && !origin_observation_valid) {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            gnss_health_manager_.updateGnss(observation.time, false, false);
+            LOGW << "NC-IC waits for GNSS usable by the current startup mode before initializing the origin";
+            return true;
+        }
+
         // 站心原点
         // The origin of the world frame
-        integration_config_.origin       = gnss.blh;
-        integration_parameters_->gravity = Earth::gravity(gnss.blh);
+        integration_config_.origin = observation.raw_blh;
+        if (!local_bootstrap_active_) {
+            integration_parameters_->gravity = Earth::gravity(observation.raw_blh);
+        }
+        // NC-IC extension: after local odom is running, later GNSS establishes
+        // map coordinates only.  Changing gravity mid-session would make old
+        // and new normal preintegrations inconsistent.
         LOGI << "Local gravity is initialized as " << Logging::doubleData(integration_parameters_->gravity);
-    } else {
-        last_last_gnss_ = last_gnss_;
-        last_gnss_      = gnss_;
+
+        if (nc_extension_enabled_ && local_bootstrap_active_) {
+            // NC-IC extension: online states already live in arbitrary local
+            // odom, so later global GNSS enters through recovery alignment.
+            pending_local_global_alignment_ = true;
+        }
     }
 
-    gnss_        = gnss;
-    gnss_.blh    = Earth::global2local(integration_config_.origin, gnss_.blh);
-    isgnssready_ = true;
+    observation.raw_local = Earth::global2local(integration_config_.origin, observation.raw_blh);
+    observation.blh       = observation.raw_local;
+
+    if (nc_extension_enabled_ && (gvinsstate_ == GVINS_INITIALIZING) &&
+        (!observation.quality_valid || !observation.vertical_valid || observation.forced_degraded)) {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        gnss_health_manager_.updateGnss(observation.time, false, false);
+        LOGW << "NC-IC rejects degraded GNSS during the original IC initialization stage";
+        return true;
+    }
+
+    if (!gnss_buffer_.empty() && observation.time <= gnss_buffer_.back().time) {
+        LOGW << "NC-IC drops out-of-order GNSS packet at " << Logging::doubleData(observation.time);
+        return true;
+    }
+    // NC-IC extension: buffer GNSS measurements until the fusion thread
+    // consumes them in timestamp order; a newer callback can no longer erase
+    // recovery evidence or an asynchronous raw anchor.
+    gnss_buffer_.push_back(observation);
 
     return true;
 }
 
+bool GVINS::hasPendingGnss(double fusion_time) {
+    if (current_gnss_pending_) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(gnss_buffer_mutex_);
+    return !gnss_buffer_.empty() && gnss_buffer_.front().time < fusion_time;
+}
+
+bool GVINS::loadNextGnss(double fusion_time) {
+    if (current_gnss_pending_) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(gnss_buffer_mutex_);
+        if (gnss_buffer_.empty() || gnss_buffer_.front().time >= fusion_time) {
+            return false;
+        }
+        last_last_gnss_ = last_gnss_;
+        last_gnss_ = gnss_;
+        gnss_ = gnss_buffer_.front();
+        gnss_buffer_.pop_front();
+    }
+    current_gnss_pending_ = true;
+    isgnssprepared_ = false;
+    last_processed_gnss_time_ = gnss_.time;
+    if (pending_local_global_alignment_.exchange(false)) {
+        beginRecoverySegment(gnss_.time);
+    }
+    return true;
+}
+
+void GVINS::consumeCurrentGnss() {
+    current_gnss_pending_ = false;
+}
+
+void GVINS::checkGnssTimeout(double fusion_time) {
+    if (!nc_extension_enabled_ || gnss_timeout_ <= 0.0 || last_processed_gnss_time_ <= 0.0 ||
+        gnss_timeout_active_ || (fusion_time - last_processed_gnss_time_) <= gnss_timeout_) {
+        return;
+    }
+    bool is_active = false;
+    {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        is_active = gnss_health_manager_.horizontalState() == SensorHealthState::ACTIVE;
+    }
+    if (is_active) {
+        // NC-IC extension: a configured availability timeout opens a recovery
+        // segment when the receiver is silent; it does not estimate data rate.
+        beginRecoverySegment(fusion_time);
+        gnss_timeout_active_ = true;
+        LOGW << "NC-IC marks GNSS degraded after configured observation timeout";
+    }
+}
+
+bool GVINS::addNewHeading(const HeadingObservation &heading) {
+    if (!use_magnetic_heading_ || !heading.valid || heading.std <= 0) {
+        return true;
+    }
+    latest_heading_ = heading;
+    if (gvinsstate_ < GVINS_TRACKING_INITIALIZING) {
+        // NC-IC extension: before window factors exist, retain calibrated yaw
+        // so a static IC/local initialization may use it as heading evidence.
+        return true;
+    }
+
+    if (!state_mutex_.try_lock()) {
+        return false;
+    }
+    if (timelist_.empty()) {
+        state_mutex_.unlock();
+        return true;
+    }
+
+    size_t nearest = 0;
+    double nearest_dt = std::numeric_limits<double>::max();
+    for (size_t k = 0; k < timelist_.size(); k++) {
+        const double dt = std::abs(timelist_[k] - heading.time);
+        if (dt < nearest_dt) {
+            nearest_dt = dt;
+            nearest = k;
+        }
+    }
+    if (nearest_dt <= heading_max_sync_interval_) {
+        HeadingObservation accepted = heading;
+        accepted.time = timelist_[nearest];
+        const auto &pose = statedatalist_[nearest].pose;
+        const double predicted_yaw =
+            std::atan2(2.0 * (pose[6] * pose[5] + pose[3] * pose[4]),
+                       1.0 - 2.0 * (pose[4] * pose[4] + pose[5] * pose[5]));
+        accepted.innovation =
+            std::abs(std::atan2(std::sin(predicted_yaw - accepted.yaw),
+                                std::cos(predicted_yaw - accepted.yaw)));
+        ModalityDecision decision;
+        {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            decision = gnss_health_manager_.updateHeading(
+                accepted.time, accepted.innovation <= heading_innovation_threshold_,
+                accepted.innovation);
+        }
+        accepted.health_state = decision.health.state;
+        accepted.covariance_scale = decision.covariance_scale;
+        if (!decision.admit) {
+            LOGW << "NC-IC rejects calibrated heading by modality health gate, innovation "
+                 << accepted.innovation * R2D << " deg";
+            state_mutex_.unlock();
+            return true;
+        }
+        accepted.std *= accepted.covariance_scale;
+        headinglist_.push_back(accepted);
+        isheadingobs_ = true;
+        optimization_sem_.notify_one();
+        // NC-IC extension: calibrated heading is attached to an existing IC
+        // state rather than creating a parallel high-rate state chain.
+        LOGI << "NC-IC adds calibrated heading at " << Logging::doubleData(accepted.time);
+    }
+    state_mutex_.unlock();
+    return true;
+}
+
+Vector3d GVINS::predictedAntennaPosition() const {
+    if (ins_window_.empty()) {
+        return Vector3d::Zero();
+    }
+
+    IntegrationState state = ins_window_.back().second;
+    const size_t state_index = MISC::getInsWindowIndex(ins_window_, gnss.time);
+    if (state_index > 0 && state_index < ins_window_.size()) {
+        MISC::statePoseInterpolation(ins_window_[state_index - 1].second,
+                                     ins_window_[state_index].second, gnss.time, state);
+    }
+    return state.p + state.q.toRotationMatrix() * antlever_;
+}
+
+Vector3d GVINS::adjustedOnlineGnssMeasurement(const GNSS &gnss) const {
+    if (!gnss.use_online_offset || !gnss.recovery_deviation.valid) {
+        return gnss.raw_local;
+    }
+    const Matrix3d rotation =
+        Eigen::AngleAxisd(gnss.recovery_deviation.yaw, Vector3d::UnitZ()).toRotationMatrix();
+    return rotation * gnss.raw_local + gnss.recovery_deviation.translation;
+}
+
+void GVINS::emitRecoveryEvent(RecoveryEventType type, double time) {
+    RecoveryEventCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+        callback = recovery_event_callback_;
+    }
+    if (!callback) {
+        return;
+    }
+
+    RecoveryEventData event;
+    event.time = time;
+    event.segment_id = recovery_segment_id_;
+    event.event_type = type;
+    event.deviation = recovery_deviation_;
+    callback(event);
+}
+
+void GVINS::beginRecoverySegment(double time) {
+    if (recovery_deviation_.valid) {
+        emitRecoveryEvent(RecoveryEventType::SEGMENT_CLOSED, time);
+    }
+    recovery_segment_id_++;
+    recovery_alignment_pairs_.clear();
+    recovery_deviation_ = RecoveryDeviation();
+    recovery_deviation_.segment_id = recovery_segment_id_;
+    {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        gnss_health_manager_.forceGnssDegraded();
+    }
+    // NC-IC extension: each lost/recovered episode gets its own transform;
+    // drift from an earlier interval must never be silently reused.
+    LOGW << "NC-IC begins GNSS recovery segment " << recovery_segment_id_;
+    emitRecoveryEvent(RecoveryEventType::DEGRADED_START, time);
+}
+
+bool GVINS::estimateRecoveryDeviation() {
+    if (recovery_alignment_pairs_.empty()) {
+        return false;
+    }
+
+    Vector3d mean_map = Vector3d::Zero();
+    Vector3d mean_odom = Vector3d::Zero();
+    for (const auto &pair : recovery_alignment_pairs_) {
+        mean_map += pair.first;
+        mean_odom += pair.second;
+    }
+    mean_map /= static_cast<double>(recovery_alignment_pairs_.size());
+    mean_odom /= static_cast<double>(recovery_alignment_pairs_.size());
+
+    double maximum_baseline = 0.0;
+    for (size_t i = 0; i < recovery_alignment_pairs_.size(); i++) {
+        for (size_t j = i + 1; j < recovery_alignment_pairs_.size(); j++) {
+            maximum_baseline =
+                std::max(maximum_baseline,
+                         (recovery_alignment_pairs_[i].first.head<2>() -
+                          recovery_alignment_pairs_[j].first.head<2>()).norm());
+        }
+    }
+
+    double yaw = 0.0;
+    bool yaw_observable = recovery_alignment_pairs_.size() >= 2 &&
+                          maximum_baseline >= recovery_min_horizontal_baseline_;
+    if (yaw_observable) {
+        double cosine_term = 0.0;
+        double sine_term = 0.0;
+        for (const auto &pair : recovery_alignment_pairs_) {
+            const Vector3d map = pair.first - mean_map;
+            const Vector3d odom = pair.second - mean_odom;
+            cosine_term += map[0] * odom[0] + map[1] * odom[1];
+            sine_term += map[0] * odom[1] - map[1] * odom[0];
+        }
+        yaw = std::atan2(sine_term, cosine_term);
+        if (std::abs(yaw) > recovery_max_yaw_) {
+            // NC-IC extension: an excessive yaw is treated as unobservable or
+            // inconsistent rather than letting a recovery measurement conceal
+            // initialization/model errors in the online trajectory.
+            LOGW << "NC-IC rejects excessive recovery yaw " << yaw * R2D << " deg";
+            yaw = 0.0;
+            yaw_observable = false;
+        }
+    }
+
+    const Matrix3d rotation = Eigen::AngleAxisd(yaw, Vector3d::UnitZ()).toRotationMatrix();
+    recovery_deviation_.valid = true;
+    recovery_deviation_.yaw = yaw;
+    recovery_deviation_.translation = mean_odom - rotation * mean_map;
+    recovery_deviation_.yaw_observable = yaw_observable;
+    recovery_deviation_.supporting_samples = static_cast<int>(recovery_alignment_pairs_.size());
+    return true;
+}
+
+bool GVINS::prepareGnssForOnlineFusion() {
+    if (isgnssprepared_) {
+        return true;
+    }
+
+    if (!nc_extension_enabled_) {
+        isgnssprepared_ = true;
+        return true;
+    }
+
+    bool horizontal_valid = gnss_.quality_valid && gnss_.horizontal_valid && !gnss_.forced_degraded;
+    bool vertical_valid = gnss_.vertical_valid && !gnss_.forced_degraded;
+    const bool has_prediction = !ins_window_.empty() && (gvinsstate_ >= GVINS_INITIALIZING_INS);
+    SensorHealthState previous_health;
+    {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        previous_health = gnss_health_manager_.horizontalState();
+    }
+    double horizontal_error = 0.0;
+    double vertical_error = 0.0;
+
+    if (horizontal_valid && has_prediction && previous_health == SensorHealthState::ACTIVE) {
+        // NC-IC extension: test the measurement in the current online frame.
+        // After recovery this includes the fixed deviation term; a new large
+        // mismatch therefore starts a fresh degraded/recovery episode.
+        gnss_.use_online_offset = recovery_deviation_.valid;
+        gnss_.recovery_deviation = recovery_deviation_;
+        const Vector3d online_measurement = adjustedOnlineGnssMeasurement(gnss_);
+        const Vector3d innovation = predictedAntennaPosition() - online_measurement;
+        horizontal_error = innovation.head<2>().norm();
+        vertical_error = std::abs(innovation[2]);
+        if (horizontal_error > gnss_horizontal_innovation_threshold_) {
+            horizontal_valid = false;
+            LOGW << "NC-IC marks horizontal GNSS degraded by online innovation: " << horizontal_error;
+        }
+        if (vertical_valid && (vertical_error > gnss_vertical_innovation_threshold_)) {
+            // NC-IC extension: a vertical innovation no longer removes good
+            // horizontal GNSS; it disables only the height row in the factor.
+            vertical_valid = false;
+            LOGW << "NC-IC disables GNSS height by vertical innovation: " << vertical_error;
+        }
+    }
+
+    SensorHealthManager::Decision decision;
+    {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        decision = gnss_health_manager_.updateGnss(gnss_.time, horizontal_valid, vertical_valid,
+                                                    horizontal_error, vertical_error);
+    }
+    gnss_.health_state = decision.state;
+    gnss_.horizontal_health_state = decision.horizontal.state;
+    gnss_.vertical_health_state = decision.vertical.state;
+    gnss_.horizontal_valid = decision.horizontal.accepted;
+    gnss_.vertical_valid = decision.vertical.accepted;
+
+    if (decision.state == SensorHealthState::DEGRADED &&
+        previous_health == SensorHealthState::ACTIVE) {
+        beginRecoverySegment(gnss_.time);
+    }
+
+    const bool is_recovery_candidate =
+        horizontal_valid && has_prediction &&
+        (previous_health == SensorHealthState::DEGRADED || previous_health == SensorHealthState::RECOVERING);
+    if (is_recovery_candidate) {
+        recovery_alignment_pairs_.emplace_back(gnss_.raw_local, predictedAntennaPosition());
+        estimateRecoveryDeviation();
+        LOGI << "NC-IC estimates recovery deviation segment " << recovery_segment_id_
+             << ", translation " << recovery_deviation_.translation.transpose()
+             << ", yaw " << recovery_deviation_.yaw * R2D << " deg";
+    }
+
+    if (!decision.accept_online) {
+        // NC-IC extension: degraded and unconfirmed recovery observations are
+        // preserved as health evidence but do not enter the online window.
+        // A geometrically valid recovery candidate still anchors the
+        // asynchronous unbiased map, where it cannot jump online odom.
+        if (is_recovery_candidate && horizontal_valid) {
+            emitRecoveryAnchor(gnss_);
+        }
+        return false;
+    }
+
+    if (recovery_deviation_.valid) {
+        // NC-IC extension: the same healthy recovered GNSS is used online
+        // through an explicit fixed segment transform. raw_local remains the
+        // unchanged globally unbiased anchor for the asynchronous map graph.
+        gnss_.recovery_deviation = recovery_deviation_;
+        gnss_.online_offset = recovery_deviation_.translation;
+        gnss_.use_online_offset = true;
+    }
+    gnss_.use_height_bias = enable_height_bias_ && gnss_.vertical_valid;
+    if (gnss_.use_height_bias) {
+        // NC-IC extension: seed a newly accepted height state from the last
+        // valid segment value; Ceres then refines it under random walk.
+        for (auto it = gnsslist_.rbegin(); it != gnsslist_.rend(); ++it) {
+            if (it->use_height_bias) {
+                gnss_.height_bias = it->height_bias;
+                break;
+            }
+        }
+    }
+
+    if (decision.state == SensorHealthState::ACTIVE &&
+        (previous_health == SensorHealthState::RECOVERING ||
+         previous_health == SensorHealthState::DEGRADED) &&
+        recovery_deviation_.valid) {
+        emitRecoveryEvent(RecoveryEventType::RECOVERY_CONFIRMED, gnss_.time);
+        gnss_timeout_active_ = false;
+        if (local_bootstrap_active_) {
+            // NC-IC extension: for a local-start session this recovery is also
+            // the first confirmed map-to-odom global alignment.
+            emitRecoveryEvent(RecoveryEventType::GLOBAL_ALIGNED, gnss_.time);
+        }
+    }
+
+    isgnssprepared_ = true;
+    return true;
+}
+
+void GVINS::emitRecoveryAnchor(const GNSS &gnss) {
+    RecoveryFrameCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+        callback = recovery_frame_callback_;
+    }
+    if (!callback || ins_window_.empty()) {
+        return;
+    }
+
+    IntegrationState state = ins_window_.back().second;
+    const size_t state_index = MISC::getInsWindowIndex(ins_window_, gnss.time);
+    if (state_index > 0 && state_index < ins_window_.size()) {
+        // NC-IC extension: map-only anchors are emitted at the GNSS timestamp.
+        // Original IC-GVINS has no asynchronous map graph, so it never needed
+        // this extra interpolation boundary.
+        MISC::statePoseInterpolation(ins_window_[state_index - 1].second,
+                                     ins_window_[state_index].second, gnss.time, state);
+    }
+    RecoveryFrameData packet;
+    packet.time = gnss.time;
+    packet.node_id = static_cast<std::uint64_t>(std::llround(gnss.time * 1000000.0));
+    packet.revision = ++recovery_frame_revisions_[packet.node_id];
+    packet.segment_id = recovery_segment_id_;
+    packet.position = state.p;
+    packet.orientation = state.q;
+    packet.antenna_lever = antlever_;
+    packet.has_raw_gnss = true;
+    packet.map_only_anchor = true;
+    packet.horizontal_valid = gnss.quality_valid && !gnss.forced_degraded;
+    packet.vertical_valid = gnss.vertical_valid && !gnss.forced_degraded;
+    packet.raw_gnss = gnss.raw_local;
+    packet.gnss_std = gnss.std;
+    packet.online_offset = recovery_deviation_.translation;
+    packet.online_yaw = recovery_deviation_.yaw;
+    packet.online_yaw_observable = recovery_deviation_.yaw_observable;
+    packet.health_state = gnss.health_state;
+    packet.horizontal_health_state = gnss.horizontal_health_state;
+    packet.vertical_health_state = gnss.vertical_health_state;
+    callback(packet);
+}
+
+void GVINS::emitRecoveryFrames() {
+    RecoveryFrameCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+        callback = recovery_frame_callback_;
+    }
+    if (!callback) {
+        return;
+    }
+
+    // NC-IC extension: publish graph-worthy nodes before marginalization.
+    // The first implementation copied every window state on every solve;
+    // restricting packets to keyframes/GNSS anchors and assigning revisions
+    // keeps asynchronous graph traffic bounded while allowing refinements.
+    for (const auto &statedata : statedatalist_) {
+        RecoveryFrameData packet;
+        packet.time = statedata.time;
+        packet.node_id = static_cast<std::uint64_t>(std::llround(statedata.time * 1000000.0));
+        packet.revision = ++recovery_frame_revisions_[packet.node_id];
+        packet.segment_id = recovery_segment_id_;
+        packet.position = Vector3d(statedata.pose[0], statedata.pose[1], statedata.pose[2]);
+        packet.orientation =
+            Quaterniond(statedata.pose[6], statedata.pose[3], statedata.pose[4], statedata.pose[5]);
+        packet.antenna_lever = antlever_;
+        {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            packet.health_state = gnss_health_manager_.gnssState();
+            packet.horizontal_health_state = gnss_health_manager_.horizontalState();
+            packet.vertical_health_state = gnss_health_manager_.verticalState();
+        }
+        packet.online_offset = recovery_deviation_.translation;
+        packet.online_yaw = recovery_deviation_.yaw;
+        packet.online_yaw_observable = recovery_deviation_.yaw_observable;
+
+        for (const auto &keyframe : map_->keyframes()) {
+            if (MISC::isTheSameTimeNode(keyframe.second->stamp(), statedata.time,
+                                        MISC::MINIMUM_TIME_INTERVAL)) {
+                packet.is_keyframe = true;
+                break;
+            }
+        }
+
+        for (const auto &gnss : gnsslist_) {
+            if (MISC::isTheSameTimeNode(gnss.time, statedata.time, MISC::MINIMUM_TIME_INTERVAL)) {
+                packet.has_raw_gnss = true;
+                packet.horizontal_valid = gnss.horizontal_valid;
+                packet.vertical_valid = gnss.vertical_valid;
+                packet.raw_gnss = gnss.raw_local;
+                packet.gnss_std = gnss.std;
+                packet.online_offset = gnss.online_offset;
+                packet.online_yaw = gnss.recovery_deviation.yaw;
+                packet.online_yaw_observable = gnss.recovery_deviation.yaw_observable;
+                packet.segment_id = gnss.recovery_deviation.segment_id;
+                packet.estimated_height_bias = gnss.height_bias;
+                packet.height_bias_valid = gnss.use_height_bias;
+                packet.health_state = gnss.health_state;
+                packet.horizontal_health_state = gnss.horizontal_health_state;
+                packet.vertical_health_state = gnss.vertical_health_state;
+                break;
+            }
+        }
+        if (packet.is_keyframe || packet.has_raw_gnss) {
+            callback(packet);
+        }
+    }
+}
+
 bool GVINS::addNewFrame(const Frame::Ptr &frame) {
+    // NC-IC extension: frames are admitted only after either the original
+    // GNSS/INS initialization or the explicit static local initializer has
+    // provided a metric inertial state.  Raw pre-initialization images alone
+    // cannot constitute a valid visual-inertial initialization.
     if (gvinsstate_ > GVINS_INITIALIZING_INS) {
         if (frame_buffer_mutex_.try_lock()) {
             frame_buffer_.push(frame);
@@ -246,11 +941,14 @@ void GVINS::runFusion() {
 
         // 获取所有有效数据
         // Process all IMU data
-        while (!imu_buffer_.empty()) { // IMU BUFFER
+        while (true) { // IMU BUFFER
             // 读取IMU缓存
             // Load an IMU sample
             {
                 Lock lock2(imu_buffer_mutex_);
+                if (imu_buffer_.empty()) {
+                    break;
+                }
                 imu_pre = imu_cur;
                 imu_cur = imu_buffer_.front();
                 imu_buffer_.pop();
@@ -294,8 +992,14 @@ void GVINS::runFusion() {
 
                 // 融合状态
                 // Fusion process
+                if (gvinsstate_ > GVINS_INITIALIZING && nc_extension_enabled_ &&
+                    state_mutex_.try_lock()) {
+                    checkGnssTimeout(imu_cur.time);
+                    state_mutex_.unlock();
+                }
                 if (gvinsstate_ == GVINS_INITIALIZING) {
-                    if (isgnssready_ && state_mutex_.try_lock()) {
+                    if (hasPendingGnss(imu_cur.time) && state_mutex_.try_lock()) {
+                        loadNextGnss(imu_cur.time);
                         // 初始化参数
                         // GVINS initialization using GNSS/INS initialization
                         if (gvinsInitialization()) {
@@ -305,34 +1009,57 @@ void GVINS::runFusion() {
                             // Redo INS mechanization
                             isoptimized_ = true;
                         }
-                        isgnssready_ = false;
+                        consumeCurrentGnss();
 
                         state_mutex_.unlock();
                         continue;
                     }
+                    if (enable_local_bootstrap_ && state_mutex_.try_lock()) {
+                        if (gvinsLocalInitialization()) {
+                            // NC-IC extension: local initialization supplies
+                            // the inertial prior needed by the existing visual
+                            // initialization path, without inserting fake GNSS.
+                            gvinsstate_ = GVINS_INITIALIZING_VIO;
+                            isoptimized_ = true;
+                        }
+                        state_mutex_.unlock();
+                    }
                 } else if (gvinsstate_ == GVINS_INITIALIZING_INS) {
                     // 新的GNSS观测到来, 进行优化
                     // New GNSS, do GNSS/INS integration
-                    if (isgnssready_ && state_mutex_.try_lock()) {
+                    if (hasPendingGnss(imu_cur.time) && state_mutex_.try_lock()) {
+                        loadNextGnss(imu_cur.time);
                         // 需要保证数据对齐, 否则等待
                         // For data align
                         if (gnss_.time < ins_window_.back().first.time) {
+                            if (prepareGnssForOnlineFusion()) {
+                                // 加入新的GNSS节点
+                                // Add a new GNSS time node
+                                addNewGnssTimeNode();
 
-                            // 加入新的GNSS节点
-                            // Add a new GNSS time node
-                            addNewGnssTimeNode();
-
-                            isgnssready_ = false;
-                            isgnssobs_   = true;
-                            optimization_sem_.notify_one();
+                                consumeCurrentGnss();
+                                isgnssobs_   = true;
+                                optimization_sem_.notify_one();
+                            } else {
+                                // NC-IC extension: retain initialization
+                                // states without admitting a degraded global
+                                // measurement into the IC window.
+                                consumeCurrentGnss();
+                            }
                         }
                         state_mutex_.unlock();
                     }
                 } else if (gvinsstate_ == GVINS_INITIALIZING_VIO) {
                     // 仅加入关键帧节点, 而不进行优化
                     // Add new time node during the initialization of the visual system
-                    if ((isframeready_ || isgnssready_) && state_mutex_.try_lock()) {
-                        if (isframeready_ && (keyframes_.front()->stamp() < ins_window_.back().first.time)) {
+                    if ((isframeready_ || hasPendingGnss(imu_cur.time)) && state_mutex_.try_lock()) {
+                        bool frame_time_ready = false;
+                        {
+                            Lock keyframe_lock(keyframes_mutex_);
+                            frame_time_ready = isframeready_ && !keyframes_.empty() &&
+                                               (keyframes_.front()->stamp() < ins_window_.back().first.time);
+                        }
+                        if (frame_time_ready) {
                             addNewKeyFrameTimeNode();
 
                             isframeready_ = false;
@@ -342,17 +1069,25 @@ void GVINS::runFusion() {
 
                         // 如果有GNSS观测, 也要添加节点
                         // Add GNSS if available
-                        if (isgnssready_) {
-                            if (insertNewGnssTimeNode()) {
-                                isgnssready_ = false;
+                        if (loadNextGnss(imu_cur.time)) {
+                            if (!prepareGnssForOnlineFusion()) {
+                                consumeCurrentGnss();
+                            } else if (insertNewGnssTimeNode()) {
+                                consumeCurrentGnss();
                             }
                         }
 
                         state_mutex_.unlock();
                     }
                 } else if (gvinsstate_ >= GVINS_TRACKING_INITIALIZING) {
-                    if ((isframeready_ || isgnssready_) && state_mutex_.try_lock()) {
-                        if (isframeready_ && (keyframes_.front()->stamp() < ins_window_.back().first.time)) {
+                    if ((isframeready_ || hasPendingGnss(imu_cur.time)) && state_mutex_.try_lock()) {
+                        bool frame_time_ready = false;
+                        {
+                            Lock keyframe_lock(keyframes_mutex_);
+                            frame_time_ready = isframeready_ && !keyframes_.empty() &&
+                                               (keyframes_.front()->stamp() < ins_window_.back().first.time);
+                        }
+                        if (frame_time_ready) {
                             addNewKeyFrameTimeNode();
 
                             isframeready_ = false;
@@ -361,17 +1096,22 @@ void GVINS::runFusion() {
 
                         // 如果有GNSS观测
                         // Add GNSS if available
-                        if (isgnssready_) {
-                            if (insertNewGnssTimeNode()) {
-                                isgnssready_ = false;
+                        if (loadNextGnss(imu_cur.time)) {
+                            if (!prepareGnssForOnlineFusion()) {
+                                consumeCurrentGnss();
+                            } else if (insertNewGnssTimeNode()) {
+                                consumeCurrentGnss();
                                 isgnssobs_   = true;
                             }
                         }
 
                         state_mutex_.unlock();
 
-                        // Release the optimization semaphore
-                        if (isvisualobs_) {
+                        // NC-IC extension: original IC-GVINS only woke this
+                        // optimizer for visual observations in normal
+                        // tracking.  Recovery GNSS must affect online odom
+                        // even when no fresh keyframe arrives at that instant.
+                        if (isvisualobs_ || isgnssobs_) {
                             optimization_sem_.notify_one();
                         }
                     }
@@ -401,7 +1141,7 @@ void GVINS::runOptimization() {
         Lock lock(optimization_mutex_);
         optimization_sem_.wait(lock);
 
-        if (isgnssobs_ || isvisualobs_) {
+        if (isgnssobs_ || isvisualobs_ || isheadingobs_) {
             timecost.restart();
 
             // 加锁, 保护状态量
@@ -432,6 +1172,10 @@ void GVINS::runOptimization() {
                 // 两次非线性优化并进行粗差剔除
                 // Two-steps optimization with outlier culling
                 gvinsOptimization();
+
+                // NC-IC extension: the asynchronous map node consumes a copy
+                // of the optimized online window before old states disappear.
+                emitRecoveryFrames();
 
                 timecost2.restart();
 
@@ -465,6 +1209,8 @@ void GVINS::runOptimization() {
                 isgnssobs_ = false;
             if (isvisualobs_)
                 isvisualobs_ = false;
+            if (isheadingobs_)
+                isheadingobs_ = false;
 
             // Release the state lock
             state_mutex_.unlock();
@@ -490,7 +1236,7 @@ void GVINS::runTracking() {
 
         // 处理所有缓存
         // Process all the frames
-        while (!frame_buffer_.empty()) {
+        while (true) {
             TimeCost timecost;
 
             Pose pose_b_c;
@@ -504,6 +1250,10 @@ void GVINS::runTracking() {
             // 读取缓存
             {
                 frame_buffer_mutex_.lock();
+                if (frame_buffer_.empty()) {
+                    frame_buffer_mutex_.unlock();
+                    break;
+                }
                 frame = frame_buffer_.front();
 
                 // 保证每个图像都有先验的惯导位姿
@@ -632,7 +1382,15 @@ bool GVINS::gvinsInitialization() {
             initatt[2] = last_gnss_.yaw;
             LOGI << "Initialized heading from dual-antenna GNSS as " << initatt[2] * R2D << " deg";
         } else {
-            Vector3d vel = gnss_.blh - last_gnss_.blh;
+            const double gnss_dt = gnss_.time - last_gnss_.time;
+            if (gnss_dt <= 0.0) {
+                return false;
+            }
+            // NC-IC extension: the original threshold was applied to
+            // displacement between adjacent GNSS packets, making startup
+            // depend on GNSS rate.  Apply the configured motion criterion to
+            // velocity so 1 Hz and 10 Hz receivers express the same rule.
+            Vector3d vel = (gnss_.blh - last_gnss_.blh) / gnss_dt;
             if (vel.norm() < MINMUM_ALIGN_VELOCITY) {
                 return false;
             }
@@ -645,6 +1403,13 @@ bool GVINS::gvinsInitialization() {
             initatt[2] = atan2(vel.y(), vel.x());
             LOGI << "Initialized heading from GNSS as " << initatt[2] * R2D << " deg";
         }
+    } else if (use_magnetic_heading_ && latest_heading_.valid) {
+        // NC-IC extension: original IC waits for GNSS motion to initialize
+        // heading.  A configured calibrated heading can complete a static
+        // initialization, while default-off datasets retain original logic.
+        initatt[2] = latest_heading_.yaw;
+        LOGI << "Initialized heading from calibrated external heading as "
+             << initatt[2] * R2D << " deg";
     } else {
         return false;
     }
@@ -684,10 +1449,55 @@ bool GVINS::gvinsInitialization() {
 
     LOGI << "Initialization at " << Logging::doubleData(gnss_.time);
 
+    if (nc_extension_enabled_) {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        // NC-IC extension: GNSS accepted for original IC initialization is
+        // already trusted. Seed health so a following silent outage is
+        // observable without waiting for another positioning packet.
+        gnss_health_manager_.updateGnss(gnss_.time, true, true);
+    }
+
     // 加入当前GNSS时间节点
     // Add current GNSS time node
     addNewGnssTimeNode();
 
+    return true;
+}
+
+bool GVINS::gvinsLocalInitialization() {
+    if (!nc_extension_enabled_ || !enable_local_bootstrap_ || !local_initializer_ ||
+        local_bootstrap_active_) {
+        return false;
+    }
+    if (!force_local_startup_ && !integration_config_.origin.isZero()) {
+        // NC-IC extension: if a trustworthy GNSS origin has already arrived,
+        // preserve the original IC Earth-aware startup instead of silently
+        // falling back to the less informative local mode.
+        return false;
+    }
+
+    IntegrationState state;
+    const HeadingObservation *heading =
+        (use_magnetic_heading_ && latest_heading_.valid) ? &latest_heading_ : nullptr;
+    if (!local_initializer_->tryInitialize(ins_window_, heading, state)) {
+        return false;
+    }
+
+    // NC-IC extension: without geographic origin there is no valid Earth-rate
+    // expression in NED.  This local-odom session intentionally uses normal
+    // preintegration; the original trusted-GNSS startup retains Earth mode.
+    integration_config_.iswithearth = false;
+    integration_config_.islocalframe = true;
+    integration_config_.gravity = Vector3d(0, 0, integration_parameters_->gravity);
+    preintegration_options_ = Preintegration::getOptions(integration_config_);
+
+    statedatalist_.emplace_back(Preintegration::stateToData(state, preintegration_options_));
+    timelist_.push_back(state.time);
+    constructPrior(true);
+    local_bootstrap_active_ = true;
+
+    LOGW << "NC-IC initialized local odom without GNSS at " << Logging::doubleData(state.time)
+         << "; Earth-aware online propagation is retained only by the original GNSS-start path";
     return true;
 }
 
@@ -836,6 +1646,12 @@ bool GVINS::insertNewGnssTimeNode() {
         gnss.blh[0] -= statedatalist_[index - 1].mix[0] * dt;
         gnss.blh[1] -= statedatalist_[index - 1].mix[1] * dt;
         gnss.blh[2] -= statedatalist_[index - 1].mix[2] * dt;
+        // NC-IC extension: keep the raw anchor synchronized to the same time
+        // node without applying online_offset; the asynchronous map factor
+        // must remain unbiased but temporally aligned.
+        gnss.raw_local[0] -= statedatalist_[index - 1].mix[0] * dt;
+        gnss.raw_local[1] -= statedatalist_[index - 1].mix[1] * dt;
+        gnss.raw_local[2] -= statedatalist_[index - 1].mix[2] * dt;
         gnss.std *= 1.2;
 
         gnsslist_.push_back(gnss);
@@ -850,6 +1666,9 @@ bool GVINS::insertNewGnssTimeNode() {
         gnss.blh[0] += statedatalist_[index].mix[0] * dt;
         gnss.blh[1] += statedatalist_[index].mix[1] * dt;
         gnss.blh[2] += statedatalist_[index].mix[2] * dt;
+        gnss.raw_local[0] += statedatalist_[index].mix[0] * dt;
+        gnss.raw_local[1] += statedatalist_[index].mix[1] * dt;
+        gnss.raw_local[2] += statedatalist_[index].mix[2] * dt;
         gnss.std *= 1.2;
 
         gnsslist_.push_back(gnss);
@@ -1164,6 +1983,10 @@ bool GVINS::gvinsOptimization() {
     // The GNSS factors
     auto gnss_redisual_block = addGnssFactors(problem, true);
 
+    // NC-IC extension: calibrated heading is an optional yaw-only external
+    // observation and stays dormant for datasets without magnetometer data.
+    addHeadingFactors(problem, true);
+
     // 预积分残差
     // The IMU preintegration factors
     addImuFactors(problem);
@@ -1196,7 +2019,27 @@ bool GVINS::gvinsOptimization() {
         gnssOutlierCullingByChi2(problem, gnss_redisual_block);
 
         // Remove outlier reprojection factors
-        removeReprojectionFactorsByChi2(problem, residual_ids, 5.991);
+        const int visual_outliers = removeReprojectionFactorsByChi2(problem, residual_ids, 5.991);
+        if (nc_extension_enabled_ && gvinsstate_ >= GVINS_TRACKING_INITIALIZING) {
+            VisualQualityReport report;
+            report.time = timelist_.back();
+            report.residual_count = static_cast<int>(residual_ids.size());
+            report.outlier_count = visual_outliers;
+            report.outlier_ratio = residual_ids.empty()
+                                       ? 1.0
+                                       : static_cast<double>(visual_outliers) /
+                                             static_cast<double>(residual_ids.size());
+            report.valid = report.residual_count >= visual_min_residuals_ &&
+                           report.outlier_ratio <= visual_max_outlier_ratio_;
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            const auto decision =
+                gnss_health_manager_.updateVision(report.time, report.valid, report.outlier_ratio);
+            visual_factor_std_scale_ = decision.covariance_scale;
+            if (decision.health.state != SensorHealthState::ACTIVE) {
+                LOGW << "NC-IC downweights visual modality, outlier ratio "
+                     << report.outlier_ratio << ", residuals " << report.residual_count;
+            }
+        }
 
         // Remove all GNSS factors
         for (auto &block : gnss_redisual_block) {
@@ -1240,7 +2083,6 @@ bool GVINS::gvinsOptimization() {
 
 void GVINS::gnssOutlierCullingByChi2(ceres::Problem &problem,
                                      vector<std::pair<ceres::ResidualBlockId, GNSS *>> &redisual_block) {
-    double chi2_threshold = 7.815;
     double cost, chi2;
 
     int outliers_counts = 0;
@@ -1251,11 +2093,25 @@ void GVINS::gnssOutlierCullingByChi2(ceres::Problem &problem,
         problem.EvaluateResidualBlock(id, false, &cost, nullptr, nullptr);
         chi2 = cost * 2;
 
+        // NC-IC extension: original IC tested a fixed 3-D GNSS residual.
+        // Vertically rejected observations now contain only two informative
+        // rows, so their chi-square gate and reweighting must be axis aware.
+        const int dof = (gnss->horizontal_valid ? 2 : 0) + (gnss->vertical_valid ? 1 : 0);
+        if (dof == 0) {
+            continue;
+        }
+        const double chi2_threshold = (dof == 1) ? 3.841 : ((dof == 2) ? 5.991 : 7.815);
         if (chi2 > chi2_threshold) {
 
             // Reweigthed GNSS
             double scale = sqrt(chi2 / chi2_threshold);
-            gnss->std *= scale;
+            if (gnss->horizontal_valid) {
+                gnss->std[0] *= scale;
+                gnss->std[1] *= scale;
+            }
+            if (gnss->vertical_valid) {
+                gnss->std[2] *= scale;
+            }
 
             outliers_counts++;
         }
@@ -1454,6 +2310,19 @@ bool GVINS::gvinsMarginalization() {
             parameters_ids[reinterpret_cast<long>(statedata.mix)]  = parameters_id++;
         }
 
+        // NC-IC extension: height-bias states are independent GNSS parameters
+        // and must be assigned stable marginalization IDs just like poses.
+        if (enable_height_bias_) {
+            for (auto &gnss : gnsslist_) {
+                if (gnss.use_height_bias) {
+                    const long address = reinterpret_cast<long>(&gnss.height_bias);
+                    if (parameters_ids.find(address) == parameters_ids.end()) {
+                        parameters_ids[address] = parameters_id++;
+                    }
+                }
+            }
+        }
+
         // 逆深度参数
         // Inverse depth parameters
         frame         = map_->keyframes().at(keyframeids[0]);
@@ -1490,6 +2359,21 @@ bool GVINS::gvinsMarginalization() {
                 }
             }
         }
+        if (enable_height_bias_) {
+            for (auto &gnss : gnsslist_) {
+                if (!gnss.use_height_bias || gnss.time > last_time) {
+                    continue;
+                }
+                for (size_t k = 0; k < last_marginalization_parameter_blocks_.size(); k++) {
+                    if (last_marginalization_parameter_blocks_[k] == &gnss.height_bias) {
+                        // NC-IC extension: height bias is a state in the
+                        // carried prior. Eliminate it before its owning GNSS
+                        // deque element is popped, avoiding a stale block.
+                        marginalized_index.push_back(static_cast<int>(k));
+                    }
+                }
+            }
+        }
 
         auto factor   = std::make_shared<MarginalizationFactor>(last_marginalization_info_);
         auto residual = std::make_shared<ResidualBlockInfo>(factor, nullptr, last_marginalization_parameter_blocks_,
@@ -1502,11 +2386,72 @@ bool GVINS::gvinsMarginalization() {
     for (auto &gnss : gnsslist_) {
         for (size_t k = 0; k < num_marg; k++) {
             if (MISC::isTheSameTimeNode(gnss.time, timelist_[k], MISC::MINIMUM_TIME_INTERVAL)) {
-                auto factor   = std::make_shared<GnssFactor>(gnss, antlever_);
+                std::shared_ptr<ceres::CostFunction> factor;
+                std::vector<double *> parameters{statedatalist_[k].pose};
+                std::vector<int> marginalized{0};
+                if (enable_height_bias_ && gnss.use_height_bias && gnss.vertical_valid) {
+                    factor = std::make_shared<HeightBiasGnssFactor>(gnss, antlever_);
+                    parameters.push_back(&gnss.height_bias);
+                    marginalized.push_back(1);
+                } else if (gnss.use_online_offset && gnss.recovery_deviation.valid) {
+                    factor = std::make_shared<RecoveryGnssFactor>(gnss, antlever_);
+                } else {
+                    factor = std::make_shared<GnssFactor>(gnss, antlever_);
+                }
                 auto residual = std::make_shared<ResidualBlockInfo>(
-                    factor, nullptr, std::vector<double *>{statedatalist_[k].pose}, std::vector<int>{0});
+                    factor, nullptr, parameters, marginalized);
                 marginalization_info->addResidualBlockInfo(residual);
                 break;
+            }
+        }
+    }
+
+    if (enable_height_bias_) {
+        GNSS *previous_height = nullptr;
+        for (auto &gnss : gnsslist_) {
+            if (!gnss.use_height_bias || !gnss.vertical_valid) {
+                continue;
+            }
+            if (!previous_height && gnss.time <= last_time && !height_bias_prior_marginalized_) {
+                auto prior = std::make_shared<ceres::AutoDiffCostFunction<HeightBiasPriorFactor, 1, 1>>(
+                    new HeightBiasPriorFactor(0.0, height_bias_prior_std_));
+                auto residual = std::make_shared<ResidualBlockInfo>(
+                    prior, nullptr, std::vector<double *>{&gnss.height_bias}, std::vector<int>{0});
+                marginalization_info->addResidualBlockInfo(residual);
+                height_bias_prior_marginalized_ = true;
+            }
+            if (previous_height && previous_height->time <= last_time) {
+                auto random_walk =
+                    std::make_shared<ceres::AutoDiffCostFunction<HeightBiasRandomWalkFactor, 1, 1, 1>>(
+                        new HeightBiasRandomWalkFactor(height_bias_random_walk_std_,
+                                                       gnss.time - previous_height->time));
+                std::vector<int> marginalized{0};
+                if (gnss.time <= last_time) {
+                    marginalized.push_back(1);
+                }
+                auto residual = std::make_shared<ResidualBlockInfo>(
+                    random_walk, nullptr,
+                    std::vector<double *>{&previous_height->height_bias, &gnss.height_bias},
+                    marginalized);
+                marginalization_info->addResidualBlockInfo(residual);
+            }
+            previous_height = &gnss;
+        }
+    }
+
+    if (use_magnetic_heading_) {
+        for (const auto &heading : headinglist_) {
+            for (size_t k = 0; k < num_marg; k++) {
+                if (MISC::isTheSameTimeNode(heading.time, timelist_[k], MISC::MINIMUM_TIME_INTERVAL)) {
+                    auto factor =
+                        std::make_shared<ceres::AutoDiffCostFunction<HeadingFactor, 1, 7>>(
+                            new HeadingFactor(heading.yaw, heading.std));
+                    auto residual = std::make_shared<ResidualBlockInfo>(
+                        factor, nullptr, std::vector<double *>{statedatalist_[k].pose},
+                        std::vector<int>{0});
+                    marginalization_info->addResidualBlockInfo(residual);
+                    break;
+                }
             }
         }
     }
@@ -1599,7 +2544,8 @@ bool GVINS::gvinsMarginalization() {
 
             auto factor = std::make_shared<ReprojectionFactor>(
                 ref_frame_pc, obs_frame_pc, ref_feature->velocityInPixel(), obs_feature->velocityInPixel(),
-                ref_frame->timeDelay(), obs_frame->timeDelay(), optimize_reprojection_error_std_);
+                ref_frame->timeDelay(), obs_frame->timeDelay(),
+                optimize_reprojection_error_std_ * visual_factor_std_scale_);
             auto residual = std::make_shared<ResidualBlockInfo>(factor, nullptr,
                                                                 vector<double *>{statedatalist_[ref_frame_index].pose,
                                                                                  statedatalist_[obs_frame_index].pose,
@@ -1622,6 +2568,17 @@ bool GVINS::gvinsMarginalization() {
     }
     address[parameters_ids[reinterpret_cast<long>(extrinsic_)]]     = extrinsic_;
     address[parameters_ids[reinterpret_cast<long>(extrinsic_ + 7)]] = &extrinsic_[7];
+    if (enable_height_bias_) {
+        for (auto &gnss : gnsslist_) {
+            if (gnss.use_height_bias && gnss.time > last_time) {
+                const long bias_address = reinterpret_cast<long>(&gnss.height_bias);
+                auto id = parameters_ids.find(bias_address);
+                if (id != parameters_ids.end()) {
+                    address[id->second] = &gnss.height_bias;
+                }
+            }
+        }
+    }
 
     last_marginalization_parameter_blocks_ = marginalization_info->getParamterBlocks(address);
     last_marginalization_info_             = std::move(marginalization_info);
@@ -1640,6 +2597,24 @@ bool GVINS::gvinsMarginalization() {
     }
     for (size_t k = 0; k < num_gnss; k++) {
         gnsslist_.pop_front();
+    }
+    if (enable_height_bias_) {
+        bool has_retained_height_bias = false;
+        for (const auto &gnss : gnsslist_) {
+            if (gnss.use_height_bias && gnss.vertical_valid) {
+                has_retained_height_bias = true;
+                break;
+            }
+        }
+        if (!has_retained_height_bias) {
+            // NC-IC extension: a later independent valid-height segment needs
+            // its own weak zero prior after the earlier bias chain is gone.
+            height_bias_prior_marginalized_ = false;
+        }
+    }
+
+    while (!headinglist_.empty() && headinglist_.front().time <= last_time) {
+        headinglist_.pop_front();
     }
 
     // 预积分观测及时间状态
@@ -1825,7 +2800,8 @@ vector<ceres::ResidualBlockId> GVINS::addReprojectionFactors(ceres::Problem &pro
 
             auto factor = new ReprojectionFactor(ref_frame_pc, obs_frame_pc, ref_feature->velocityInPixel(),
                                                  obs_feature->velocityInPixel(), ref_frame->timeDelay(),
-                                                 obs_frame->timeDelay(), optimize_reprojection_error_std_);
+                                                 obs_frame->timeDelay(),
+                                                 optimize_reprojection_error_std_ * visual_factor_std_scale_);
             auto residual_block_id =
                 problem.AddResidualBlock(factor, loss_function, statedatalist_[ref_frame_index].pose,
                                          statedatalist_[obs_frame_index].pose, extrinsic_, invdepth, &extrinsic_[7]);
@@ -1896,16 +2872,66 @@ vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::P
         loss_function = new ceres::HuberLoss(1.0);
     }
 
+    GNSS *previous_height = nullptr;
     for (auto &data : gnsslist_) {
         int index = getStateDataIndex(data.time);
         if (index >= 0) {
-            auto factor = new GnssFactor(data, antlever_);
-            auto id     = problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+            ceres::ResidualBlockId id;
+            if (enable_height_bias_ && data.use_height_bias && data.vertical_valid) {
+                // NC-IC extension: slow vertical bias is an explicit scalar
+                // parameter.  It does not alter raw GNSS used in the map graph
+                // and is present only when the vertical channel is admitted.
+                problem.AddParameterBlock(&data.height_bias, 1);
+                auto factor = new HeightBiasGnssFactor(data, antlever_);
+                id = problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose,
+                                              &data.height_bias);
+                if (isusekernel) {
+                    // The original optimizer re-adds GNSS measurement factors
+                    // for its second pass.  Add random-walk/prior constraints
+                    // only once so the NC bias model is not double weighted.
+                    if (previous_height) {
+                        auto random_walk =
+                            new ceres::AutoDiffCostFunction<HeightBiasRandomWalkFactor, 1, 1, 1>(
+                                new HeightBiasRandomWalkFactor(height_bias_random_walk_std_,
+                                                               data.time - previous_height->time));
+                        problem.AddResidualBlock(random_walk, nullptr, &previous_height->height_bias,
+                                                 &data.height_bias);
+                    } else if (!height_bias_prior_marginalized_) {
+                        auto prior = new ceres::AutoDiffCostFunction<HeightBiasPriorFactor, 1, 1>(
+                            new HeightBiasPriorFactor(0.0, height_bias_prior_std_));
+                        problem.AddResidualBlock(prior, nullptr, &data.height_bias);
+                    }
+                    previous_height = &data;
+                }
+            } else if (data.use_online_offset && data.recovery_deviation.valid) {
+                auto factor = new RecoveryGnssFactor(data, antlever_);
+                id = problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+            } else {
+                auto factor = new GnssFactor(data, antlever_);
+                id = problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+            }
             residual_block.push_back(std::make_pair(id, &data));
         }
     }
 
     return residual_block;
+}
+
+void GVINS::addHeadingFactors(ceres::Problem &problem, bool isusekernel) {
+    if (!use_magnetic_heading_) {
+        return;
+    }
+    ceres::LossFunction *loss_function = isusekernel ? new ceres::HuberLoss(1.0) : nullptr;
+    for (const auto &heading : headinglist_) {
+        int index = getStateDataIndex(heading.time);
+        if (index >= 0 && heading.valid && heading.std > 0) {
+            // NC-IC extension: only calibrated yaw enters this factor.  Raw
+            // magnetometer processing/calibration remains outside IC-GVINS.
+            auto factor = new ceres::AutoDiffCostFunction<HeadingFactor, 1, 7>(
+                new HeadingFactor(heading.yaw, heading.std));
+            problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+        }
+    }
 }
 
 void GVINS::constructPrior(bool is_zero_velocity) {

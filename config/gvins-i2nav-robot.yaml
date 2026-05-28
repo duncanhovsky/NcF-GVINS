@@ -34,10 +34,53 @@ imumodel:
 # GNSS outage configurations, the GNSS will not be used after the gnssoutagetime 
 isusegnssoutage: false
 gnssoutagetime: 0
+# Set greater than gnssoutagetime for NC degraded-then-recovered experiments.
+gnssoutageendtime: 0
 
 # 固定阈值GNSS抗差
 # A fixed threshold (STD, m) for GNSS outlier culling
 gnssthreshold: 20
+
+# NC-IC extension: set enabled to false for an original IC-GVINS regression.
+# The active path admits recovered GNSS online through an estimated deviation
+# and sends the same raw/unbiased GNSS to the asynchronous map correction node.
+nc_extension:
+    enabled: true
+    enable_async_relocator: true
+    gnss_recovery_confirm_samples: 3
+    horizontal_recovery_confirm_samples: 3
+    vertical_recovery_confirm_samples: 5
+    horizontal_recovery_confirm_duration: 0.5
+    vertical_recovery_confirm_duration: 1.0
+    gnss_timeout: 2.0
+    gnss_horizontal_innovation_threshold: 20.0
+    gnss_vertical_innovation_threshold: 30.0
+    recovery_min_horizontal_baseline: 5.0
+    recovery_max_yaw_deg: 20.0
+    startup_mode: "auto"
+    enable_local_bootstrap: true
+    local_static_duration: 1.0
+    global_alignment_min_baseline: 5.0
+    enable_earth_handover: false
+    enable_height_bias: false
+    height_bias_random_walk_std: 0.05
+    height_bias_prior_std: 20.0
+    # No usable magnetometer stream is available in current KAIST/i2Nav data.
+    use_magnetic_heading: false
+    heading_topic: "/mag_heading"
+    heading_max_sync_interval: 0.05
+    heading_innovation_threshold_deg: 20.0
+    heading_recovery_confirm_samples: 3
+    heading_degraded_covariance_scale: 10.0
+    visual_min_residuals: 15
+    visual_max_outlier_ratio: 0.5
+    vision_degrade_confirm_frames: 2
+    vision_recovery_confirm_frames: 3
+    vision_degraded_covariance_scale: 5.0
+    imu_recovery_confirm_intervals: 5
+    imu_degraded_covariance_scale: 25.0
+    imu_max_angular_rate: 0.0
+    imu_max_specific_force: 0.0
 
 # 是否开启可视化
 # Use visualization

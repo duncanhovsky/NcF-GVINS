@@ -297,8 +297,10 @@ void PreintegrationEarth::updateJacobianAndCovariance(const IMU &imu_pre, const 
     gt.block<3, 3>(9, 6)  = Matrix3d::Identity();
     gt.block<3, 3>(12, 9) = Matrix3d::Identity();
 
+    const Eigen::MatrixXd scaled_noise = interval_noise_scale_ * noise_;
     Eigen::MatrixXd Qk =
-        0.5 * dt * (phi * gt * noise_ * gt.transpose() + gt * noise_ * gt.transpose() * phi.transpose());
+        0.5 * dt * (phi * gt * scaled_noise * gt.transpose() +
+                    gt * scaled_noise * gt.transpose() * phi.transpose());
     covariance_ = phi * covariance_ * phi.transpose() + Qk;
 }
 

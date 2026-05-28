@@ -92,6 +92,9 @@ typedef struct IntegrationConfiguration {
     bool isuseodo;
     bool iswithscale;
     bool iswithearth;
+    // NC-IC extension: a local-bootstrap run publishes metric odom before
+    // any geographic origin is available; it must not be written as BLH.
+    bool islocalframe{false};
 
     Vector3d origin; // 站心原点
     Vector3d gravity;

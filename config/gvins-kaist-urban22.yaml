@@ -1,0 +1,104 @@
+# NcF-GVINS configuration for KAIST urban data using the left stereo camera
+# as a monocular input.
+# Source reference:
+#   ncgmvins_ws/src/VINS-Fusion/config/KAIST/kaist_config2.yaml
+
+outputpath: "~/kaist_urban22/NcF-GVINS"
+is_make_outputdir: true
+
+sensor_profile:
+    dataset: "KAIST urban, config2/corrected extrinsic"
+    camera_type: "mono pinhole from stereo left camera"
+    image_rate: 20
+    imu_rate: 110
+    gnss_rate: 5
+    magnetic_rate: 110
+    source_vins_noise:
+        acc_n: 0.02
+        gyr_n: 0.003
+        acc_w: 0.005
+        gyr_w: 3.0e-5
+
+initlength: 1
+imudatarate: 110
+iswithearth: true
+
+# KAIST VINS configs do not provide a GNSS antenna lever arm and the VINS GNSS
+# factors use zero lever. Keep zero until a calibrated antenna-to-IMU lever is
+# available.
+antlever: [0.0, 0.0, 0.0]
+
+imumodel:
+    # Starter values in IC-GVINS units. Source VINS values are kept above and
+    # should be re-tuned after rosbag replay if needed.
+    arw: 0.3
+    vrw: 0.3
+    gbstd: 100.0
+    abstd: 100.0
+    corrtime: 1.0
+
+isusegnssoutage: false
+gnssoutagetime: 0
+gnssoutageendtime: 0
+gnssthreshold: 15
+
+nc_extension:
+    enabled: true
+    enable_async_relocator: true
+    gnss_recovery_confirm_samples: 3
+    horizontal_recovery_confirm_samples: 3
+    vertical_recovery_confirm_samples: 5
+    horizontal_recovery_confirm_duration: 0.8
+    vertical_recovery_confirm_duration: 1.2
+    # KAIST urban22 reference config has 5 Hz GNSS.
+    gnss_timeout: 1.0
+    gnss_horizontal_innovation_threshold: 15.0
+    gnss_vertical_innovation_threshold: 30.0
+    recovery_min_horizontal_baseline: 8.0
+    recovery_max_yaw_deg: 20.0
+    startup_mode: "auto"
+    enable_local_bootstrap: true
+    local_static_duration: 1.0
+    global_alignment_min_baseline: 8.0
+    enable_earth_handover: false
+    enable_height_bias: false
+    height_bias_random_walk_std: 0.05
+    height_bias_prior_std: 20.0
+    use_magnetic_heading: false
+    heading_topic: "/imu/mag"
+    heading_max_sync_interval: 0.05
+    heading_innovation_threshold_deg: 20.0
+    heading_recovery_confirm_samples: 3
+    heading_degraded_covariance_scale: 10.0
+    visual_min_residuals: 20
+    visual_max_outlier_ratio: 0.5
+    vision_degrade_confirm_frames: 2
+    vision_recovery_confirm_frames: 3
+    vision_degraded_covariance_scale: 5.0
+    imu_recovery_confirm_intervals: 5
+    imu_degraded_covariance_scale: 25.0
+    imu_max_angular_rate: 0.0
+    imu_max_specific_force: 0.0
+
+is_use_visualization: true
+
+track_check_histogram: false
+track_min_parallax: 15
+track_max_interval: 0.35
+track_max_features: 200
+
+reprojection_error_std: 1.5
+optimize_windows_size: 10
+optimize_num_iterations: 20
+optimize_estimate_extrinsic: true
+optimize_estimate_td: false
+
+cam0:
+    intrinsic: [816.9037899277, 811.5680382849, 608.5072628169, 263.4759976444]
+    distortion: [-0.0561430278, 0.1395256320, -0.0012155907, -0.0009728139]
+    resolution: [1280, 560]
+
+    # Corrected body_T_cam0 from kaist_config2.yaml converted to q_b_c/t_b_c.
+    q_b_c: [0.502040817, -0.505583737, 0.497780414, 0.494524785]
+    t_b_c: [0.259019133819759, -0.08972175043876206, -1.7122437426382235]
+    td_b_c: 0.0

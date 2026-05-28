@@ -266,8 +266,10 @@ void PreintegrationOdo::updateJacobianAndCovariance(const IMU &imu_pre, const IM
     gt.block<3, 3>(15, 12) = delta_state_.q.toRotationMatrix() * cvb_ * (1 + delta_state_.sodo);
     gt(18, 15)             = 1.0;
 
+    const Eigen::MatrixXd scaled_noise = interval_noise_scale_ * noise_;
     Eigen::MatrixXd Qk =
-        0.5 * dt * (phi * gt * noise_ * gt.transpose() + gt * noise_ * gt.transpose() * phi.transpose());
+        0.5 * dt * (phi * gt * scaled_noise * gt.transpose() +
+                    gt * scaled_noise * gt.transpose() * phi.transpose());
     covariance_ = phi * covariance_ * phi.transpose() + Qk;
 }
 

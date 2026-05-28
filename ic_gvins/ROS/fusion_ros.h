@@ -26,6 +26,9 @@
 #include "ic_gvins/common/types.h"
 #include "ic_gvins/ic_gvins.h"
 
+#include <ic_gvins/RecoveryEvent.h>
+#include <ic_gvins/RecoveryFrame.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
@@ -33,6 +36,8 @@
 #include <sensor_msgs/image_encodings.h>
 
 #include <memory>
+#include <queue>
+#include <string>
 
 class FusionROS {
 
@@ -50,6 +55,10 @@ private:
 
     void imageCallback(const sensor_msgs::ImageConstPtr &imagemsg);
 
+    void publishRecoveryFrame(const RecoveryFrameData &frame);
+    void publishRecoveryEvent(const RecoveryEventData &event);
+    void headingCallback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &headingmsg);
+
 private:
     std::shared_ptr<GVINS> gvins_;
 
@@ -59,10 +68,21 @@ private:
 
     bool isusegnssoutage_{false};
     double gnssoutagetime_{0};
+    double gnssoutageendtime_{0};
     double gnssthreshold_{20.0};
+    bool nc_extension_enabled_{false};
+    bool enable_async_relocator_{false};
+    bool use_magnetic_heading_{false};
+    std::string heading_topic_{"/mag_heading"};
+
+    // NC-IC extension: optimized online snapshots are sent to a separate map
+    // correction node; no relocation work runs in the real-time ROS wrapper.
+    ros::Publisher recovery_frame_pub_;
+    ros::Publisher recovery_event_pub_;
 
     std::queue<IMU> imu_buffer_;
     std::queue<Frame::Ptr> frame_buffer_;
+    std::queue<HeadingObservation> heading_buffer_;
 };
 
 #endif // FUSION_ROS_H

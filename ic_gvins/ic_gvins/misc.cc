@@ -296,12 +296,19 @@ void MISC::imuInterpolation(const IMU &imu01, IMU &imu00, IMU &imu11, double mid
     imu00.dtheta = buff.dtheta * (1 - scale);
     imu00.dvel   = buff.dvel * (1 - scale);
     imu00.odovel = buff.odovel * (1 - scale);
+    // NC-IC extension: interpolation must preserve IMU health/noise labels.
+    // Original IC-GVINS only split motion increments; the NC variant also uses
+    // these labels to inflate the preintegration covariance during suspect IMU intervals.
+    imu00.health_state = buff.health_state;
+    imu00.noise_scale  = buff.noise_scale;
 
     imu11.time   = buff.time;
     imu11.dt     = buff.time - time;
     imu11.dtheta = buff.dtheta * scale;
     imu11.dvel   = buff.dvel * scale;
     imu11.odovel = buff.odovel * scale;
+    imu11.health_state = buff.health_state;
+    imu11.noise_scale  = buff.noise_scale;
 }
 
 bool MISC::getImuSeriesFromTo(const std::deque<std::pair<IMU, IntegrationState>> &ins_windows, double start, double end,
@@ -425,11 +432,20 @@ void MISC::writeNavResult(const IntegrationConfiguration &config, const Integrat
     // 保存结果
     vector<double> result;
 
-    double time  = state.time;
-    Pose global  = Earth::local2global(config.origin, Pose{state.q.toRotationMatrix(), state.p});
-    Vector3d pos = global.t;
-    pos.segment(0, 2) *= R2D;
-    Vector3d att = Rotation::matrix2euler(global.R) * R2D;
+    double time = state.time;
+    Vector3d pos;
+    Vector3d att;
+    if (config.islocalframe) {
+        // NC-IC extension: a no-GNSS-start run remains online odom even after
+        // asynchronous map alignment; metres must not be serialized as BLH.
+        pos = state.p;
+        att = Rotation::matrix2euler(state.q.toRotationMatrix()) * R2D;
+    } else {
+        Pose global = Earth::local2global(config.origin, Pose{state.q.toRotationMatrix(), state.p});
+        pos = global.t;
+        pos.segment(0, 2) *= R2D;
+        att = Rotation::matrix2euler(global.R) * R2D;
+    }
     Vector3d vel = state.v;
     Vector3d bg  = state.bg * R2D * 3600;
     Vector3d ba  = state.ba * 1e5;

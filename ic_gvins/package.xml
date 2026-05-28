@@ -11,7 +11,16 @@
 
     <buildtool_depend>catkin</buildtool_depend>
 
+    <!-- NC-IC extension: explicit standard-message and generated-message
+         dependencies for online-to-relocation communication. -->
+    <build_depend>message_generation</build_depend>
+    <exec_depend>message_runtime</exec_depend>
+
+    <depend>geometry_msgs</depend>
+    <depend>nav_msgs</depend>
     <depend>roscpp</depend>
+    <depend>sensor_msgs</depend>
     <depend>std_msgs</depend>
+    <depend>tf2_ros</depend>
 
 </package>
