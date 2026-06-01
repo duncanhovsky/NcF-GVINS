@@ -67,7 +67,8 @@ find_package(catkin REQUIRED COMPONENTS
         roscpp
         sensor_msgs
         std_msgs
-        tf2_ros)
+        tf2_ros
+        visualization_msgs)
 
 # NC-IC extension: the asynchronous relocation node receives optimized online
 # snapshots and unbiased GNSS anchors through an explicit ROS boundary.
@@ -81,7 +82,7 @@ generate_messages(
         std_msgs)
 catkin_package(
         LIBRARIES
-        CATKIN_DEPENDS geometry_msgs message_runtime nav_msgs roscpp sensor_msgs std_msgs tf2_ros)
+        CATKIN_DEPENDS geometry_msgs message_runtime nav_msgs roscpp sensor_msgs std_msgs tf2_ros visualization_msgs)
 include_directories(
         ${catkin_INCLUDE_DIRS})
 

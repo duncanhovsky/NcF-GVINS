@@ -49,6 +49,81 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <string>
+#include <vector>
+
+namespace {
+
+const char *sensorHealthStateName(SensorHealthState state) {
+    switch (state) {
+    case SensorHealthState::UNAVAILABLE:
+        return "unavailable";
+    case SensorHealthState::ACTIVE:
+        return "active";
+    case SensorHealthState::DEGRADED:
+        return "degraded";
+    case SensorHealthState::RECOVERING:
+        return "recovering";
+    }
+    return "unknown";
+}
+
+bool isRecoverableState(SensorHealthState state) {
+    return state == SensorHealthState::DEGRADED || state == SensorHealthState::RECOVERING;
+}
+
+std::string joinReasons(const std::vector<std::string> &reasons) {
+    if (reasons.empty()) {
+        return "condition not specified";
+    }
+    std::string joined = reasons.front();
+    for (size_t i = 1; i < reasons.size(); i++) {
+        joined += "; " + reasons[i];
+    }
+    return joined;
+}
+
+void logSensorHealthTransition(const std::string &sensor, SensorHealthState previous,
+                               SensorHealthState current, const std::string &degrade_condition,
+                               const std::string &recovery_condition, double time) {
+    if (current == SensorHealthState::DEGRADED && previous != SensorHealthState::DEGRADED) {
+        LOGW << "NC-IC sensor degraded: sensor=" << sensor
+             << ", condition=" << degrade_condition
+             << ", time=" << Logging::doubleData(time)
+             << ", previous=" << sensorHealthStateName(previous);
+    } else if (previous == SensorHealthState::DEGRADED &&
+               current == SensorHealthState::RECOVERING) {
+        LOGW << "NC-IC sensor recovering: sensor=" << sensor
+             << ", condition=" << recovery_condition
+             << ", time=" << Logging::doubleData(time)
+             << ", previous=" << sensorHealthStateName(previous);
+    } else if (isRecoverableState(previous) && current == SensorHealthState::ACTIVE) {
+        LOGW << "NC-IC sensor recovered: sensor=" << sensor
+             << ", condition=" << recovery_condition
+             << ", time=" << Logging::doubleData(time)
+             << ", previous=" << sensorHealthStateName(previous);
+    }
+}
+
+std::string gnssInputDegradeReason(const GNSS &gnss, bool horizontal) {
+    std::vector<std::string> reasons;
+    if (gnss.forced_degraded) {
+        reasons.emplace_back("configured GNSS outage injection");
+    }
+    if (horizontal) {
+        if (!gnss.quality_valid) {
+            reasons.emplace_back("horizontal quality/covariance invalid");
+        }
+        if (!gnss.horizontal_valid) {
+            reasons.emplace_back("horizontal standard deviation invalid or above gnssthreshold");
+        }
+    } else if (!gnss.vertical_valid) {
+        reasons.emplace_back("vertical standard deviation invalid or above gnssthreshold");
+    }
+    return joinReasons(reasons);
+}
+
+} // namespace
 
 GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr drawer) {
     gvinsstate_ = GVINS_ERROR;
@@ -321,6 +396,19 @@ void GVINS::setRecoveryEventCallback(RecoveryEventCallback callback) {
     recovery_event_callback_ = std::move(callback);
 }
 
+void GVINS::setGnssMeasurementCallback(GnssMeasurementCallback callback) {
+    std::lock_guard<std::mutex> lock(gnss_measurement_callback_mutex_);
+    gnss_measurement_callback_ = std::move(callback);
+}
+
+void GVINS::setHealthStatusCallback(HealthStatusCallback callback) {
+    {
+        std::lock_guard<std::mutex> lock(health_status_callback_mutex_);
+        health_status_callback_ = std::move(callback);
+    }
+    emitHealthStatus(0.0);
+}
+
 bool GVINS::addNewImu(const IMU &input) {
     IMU imu = input;
     if (imu_buffer_mutex_.try_lock()) {
@@ -338,14 +426,40 @@ bool GVINS::addNewImu(const IMU &input) {
         const bool amplitude_valid =
             (imu_max_angular_rate_ <= 0.0 || angular_rate <= imu_max_angular_rate_) &&
             (imu_max_specific_force_ <= 0.0 || specific_force <= imu_max_specific_force_);
+        SensorHealthState previous_imu_health;
+        ModalityDecision decision;
         {
             std::lock_guard<std::mutex> health_lock(health_mutex_);
-            const auto decision =
+            previous_imu_health = gnss_health_manager_.imuState();
+            decision =
                 gnss_health_manager_.updateImu(imu.time, !has_gap && amplitude_valid,
                                                 has_gap ? imu.dt : std::max(angular_rate, specific_force));
             imu.health_state = decision.health.state;
             imu.noise_scale = decision.covariance_scale;
         }
+        std::vector<std::string> imu_reasons;
+        if (has_gap) {
+            imu_reasons.emplace_back(
+                absl::StrFormat("IMU time gap %.6lf s exceeds %.6lf s", imu.dt, imudatadt_ * 1.5));
+        }
+        if (!amplitude_valid) {
+            if (imu_max_angular_rate_ > 0.0 && angular_rate > imu_max_angular_rate_) {
+                imu_reasons.emplace_back(
+                    absl::StrFormat("angular rate %.6lf exceeds %.6lf", angular_rate,
+                                    imu_max_angular_rate_));
+            }
+            if (imu_max_specific_force_ > 0.0 && specific_force > imu_max_specific_force_) {
+                imu_reasons.emplace_back(
+                    absl::StrFormat("specific force %.6lf exceeds %.6lf", specific_force,
+                                    imu_max_specific_force_));
+            }
+        }
+        logSensorHealthTransition(
+            "IMU", previous_imu_health, decision.health.state, joinReasons(imu_reasons),
+            absl::StrFormat("valid IMU intervals accepted by recovery gate, samples=%d",
+                            decision.health.recovery_samples),
+            imu.time);
+        emitHealthStatus(imu.time);
         if (has_gap) {
             LOGW << absl::StrFormat("NC-IC splits suspect IMU gap at %0.3lf dt %0.3lf", imu.time, imu.dt);
 
@@ -401,9 +515,30 @@ bool GVINS::addNewGnss(const GNSS &gnss) {
             observation.quality_valid && !observation.forced_degraded &&
             (local_bootstrap_active_ || observation.vertical_valid);
         if (nc_extension_enabled_ && !origin_observation_valid) {
-            std::lock_guard<std::mutex> health_lock(health_mutex_);
-            gnss_health_manager_.updateGnss(observation.time, false, false);
-            LOGW << "NC-IC waits for GNSS usable by the current startup mode before initializing the origin";
+            SensorHealthState previous_horizontal;
+            SensorHealthState previous_vertical;
+            SensorHealthManager::Decision decision;
+            {
+                std::lock_guard<std::mutex> health_lock(health_mutex_);
+                previous_horizontal = gnss_health_manager_.horizontalState();
+                previous_vertical = gnss_health_manager_.verticalState();
+                decision = gnss_health_manager_.updateGnss(observation.time, false, false);
+            }
+            const std::string reason =
+                "origin initialization requires usable GNSS; " +
+                joinReasons({gnssInputDegradeReason(observation, true),
+                             gnssInputDegradeReason(observation, false)});
+            logSensorHealthTransition("GNSS horizontal", previous_horizontal,
+                                      decision.horizontal.state, reason,
+                                      "usable horizontal GNSS available for origin initialization",
+                                      observation.time);
+            logSensorHealthTransition("GNSS vertical", previous_vertical,
+                                      decision.vertical.state, reason,
+                                      "usable vertical GNSS available for origin initialization",
+                                      observation.time);
+            emitHealthStatus(observation.time);
+            LOGW << "NC-IC waits for GNSS usable by the current startup mode before initializing the origin, condition="
+                 << reason;
             return true;
         }
 
@@ -428,11 +563,34 @@ bool GVINS::addNewGnss(const GNSS &gnss) {
     observation.raw_local = Earth::global2local(integration_config_.origin, observation.raw_blh);
     observation.blh       = observation.raw_local;
 
+    emitGnssMeasurement(observation);
+
     if (nc_extension_enabled_ && (gvinsstate_ == GVINS_INITIALIZING) &&
         (!observation.quality_valid || !observation.vertical_valid || observation.forced_degraded)) {
-        std::lock_guard<std::mutex> health_lock(health_mutex_);
-        gnss_health_manager_.updateGnss(observation.time, false, false);
-        LOGW << "NC-IC rejects degraded GNSS during the original IC initialization stage";
+        SensorHealthState previous_horizontal;
+        SensorHealthState previous_vertical;
+        SensorHealthManager::Decision decision;
+        {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            previous_horizontal = gnss_health_manager_.horizontalState();
+            previous_vertical = gnss_health_manager_.verticalState();
+            decision = gnss_health_manager_.updateGnss(observation.time, false, false);
+        }
+        const std::string reason =
+            "original IC initialization requires non-degraded GNSS; " +
+            joinReasons({gnssInputDegradeReason(observation, true),
+                         gnssInputDegradeReason(observation, false)});
+        logSensorHealthTransition("GNSS horizontal", previous_horizontal,
+                                  decision.horizontal.state, reason,
+                                  "valid GNSS available for original IC initialization",
+                                  observation.time);
+        logSensorHealthTransition("GNSS vertical", previous_vertical,
+                                  decision.vertical.state, reason,
+                                  "valid GNSS available for original IC initialization",
+                                  observation.time);
+        emitHealthStatus(observation.time);
+        LOGW << "NC-IC rejects degraded GNSS during the original IC initialization stage, condition="
+             << reason;
         return true;
     }
 
@@ -474,7 +632,7 @@ bool GVINS::loadNextGnss(double fusion_time) {
     isgnssprepared_ = false;
     last_processed_gnss_time_ = gnss_.time;
     if (pending_local_global_alignment_.exchange(false)) {
-        beginRecoverySegment(gnss_.time);
+        beginRecoverySegment(gnss_.time, "local bootstrap needs first GNSS-to-map alignment");
     }
     return true;
 }
@@ -496,9 +654,11 @@ void GVINS::checkGnssTimeout(double fusion_time) {
     if (is_active) {
         // NC-IC extension: a configured availability timeout opens a recovery
         // segment when the receiver is silent; it does not estimate data rate.
-        beginRecoverySegment(fusion_time);
+        beginRecoverySegment(
+            fusion_time,
+            absl::StrFormat("configured GNSS observation timeout %.3lf s, last GNSS age %.3lf s",
+                            gnss_timeout_, fusion_time - last_processed_gnss_time_));
         gnss_timeout_active_ = true;
-        LOGW << "NC-IC marks GNSS degraded after configured observation timeout";
     }
 }
 
@@ -541,14 +701,27 @@ bool GVINS::addNewHeading(const HeadingObservation &heading) {
             std::abs(std::atan2(std::sin(predicted_yaw - accepted.yaw),
                                 std::cos(predicted_yaw - accepted.yaw)));
         ModalityDecision decision;
+        SensorHealthState previous_heading_health;
         {
             std::lock_guard<std::mutex> health_lock(health_mutex_);
+            previous_heading_health = gnss_health_manager_.headingState();
             decision = gnss_health_manager_.updateHeading(
                 accepted.time, accepted.innovation <= heading_innovation_threshold_,
                 accepted.innovation);
         }
         accepted.health_state = decision.health.state;
         accepted.covariance_scale = decision.covariance_scale;
+        logSensorHealthTransition(
+            "heading", previous_heading_health, decision.health.state,
+            absl::StrFormat("heading innovation %.3lf deg exceeds %.3lf deg",
+                            accepted.innovation * R2D,
+                            heading_innovation_threshold_ * R2D),
+            absl::StrFormat("heading innovation %.3lf deg within %.3lf deg, samples=%d",
+                            accepted.innovation * R2D,
+                            heading_innovation_threshold_ * R2D,
+                            decision.health.recovery_samples),
+            accepted.time);
+        emitHealthStatus(accepted.time);
         if (!decision.admit) {
             LOGW << "NC-IC rejects calibrated heading by modality health gate, innovation "
                  << accepted.innovation * R2D << " deg";
@@ -608,7 +781,48 @@ void GVINS::emitRecoveryEvent(RecoveryEventType type, double time) {
     callback(event);
 }
 
-void GVINS::beginRecoverySegment(double time) {
+void GVINS::emitGnssMeasurement(const GNSS &gnss) {
+    GnssMeasurementCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(gnss_measurement_callback_mutex_);
+        callback = gnss_measurement_callback_;
+    }
+    if (callback) {
+        callback(gnss);
+    }
+}
+
+void GVINS::emitHealthStatus(double time) {
+    HealthStatusCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(health_status_callback_mutex_);
+        callback = health_status_callback_;
+    }
+    if (!callback) {
+        return;
+    }
+
+    SensorHealthStatusData status;
+    status.time = time;
+    status.nc_extension_enabled = nc_extension_enabled_;
+    status.imu_enabled = true;
+    status.gnss_enabled = true;
+    status.vision_enabled = true;
+    status.heading_enabled = use_magnetic_heading_;
+    status.recovery_segment_id = recovery_segment_id_;
+    status.recovery_deviation_valid = recovery_deviation_.valid;
+    {
+        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        status.imu_state = gnss_health_manager_.imuState();
+        status.gnss_horizontal_state = gnss_health_manager_.horizontalState();
+        status.gnss_vertical_state = gnss_health_manager_.verticalState();
+        status.vision_state = gnss_health_manager_.visionState();
+        status.heading_state = gnss_health_manager_.headingState();
+    }
+    callback(status);
+}
+
+void GVINS::beginRecoverySegment(double time, const string &reason) {
     if (recovery_deviation_.valid) {
         emitRecoveryEvent(RecoveryEventType::SEGMENT_CLOSED, time);
     }
@@ -622,7 +836,10 @@ void GVINS::beginRecoverySegment(double time) {
     }
     // NC-IC extension: each lost/recovered episode gets its own transform;
     // drift from an earlier interval must never be silently reused.
-    LOGW << "NC-IC begins GNSS recovery segment " << recovery_segment_id_;
+    LOGW << "NC-IC sensor degraded: sensor=GNSS, condition=" << reason
+         << ", time=" << Logging::doubleData(time)
+         << ", recovery_segment=" << recovery_segment_id_;
+    emitHealthStatus(time);
     emitRecoveryEvent(RecoveryEventType::DEGRADED_START, time);
 }
 
@@ -692,18 +909,31 @@ bool GVINS::prepareGnssForOnlineFusion() {
         return true;
     }
 
-    bool horizontal_valid = gnss_.quality_valid && gnss_.horizontal_valid && !gnss_.forced_degraded;
-    bool vertical_valid = gnss_.vertical_valid && !gnss_.forced_degraded;
+    const bool input_horizontal_valid =
+        gnss_.quality_valid && gnss_.horizontal_valid && !gnss_.forced_degraded;
+    const bool input_vertical_valid = gnss_.vertical_valid && !gnss_.forced_degraded;
+    bool horizontal_valid = input_horizontal_valid;
+    bool vertical_valid = input_vertical_valid;
     const bool has_prediction = !ins_window_.empty() && (gvinsstate_ >= GVINS_INITIALIZING_INS);
-    SensorHealthState previous_health;
+    SensorHealthState previous_horizontal_health;
+    SensorHealthState previous_vertical_health;
     {
         std::lock_guard<std::mutex> health_lock(health_mutex_);
-        previous_health = gnss_health_manager_.horizontalState();
+        previous_horizontal_health = gnss_health_manager_.horizontalState();
+        previous_vertical_health = gnss_health_manager_.verticalState();
     }
     double horizontal_error = 0.0;
     double vertical_error = 0.0;
+    std::vector<std::string> horizontal_reasons;
+    std::vector<std::string> vertical_reasons;
+    if (!input_horizontal_valid) {
+        horizontal_reasons.emplace_back(gnssInputDegradeReason(gnss_, true));
+    }
+    if (!input_vertical_valid) {
+        vertical_reasons.emplace_back(gnssInputDegradeReason(gnss_, false));
+    }
 
-    if (horizontal_valid && has_prediction && previous_health == SensorHealthState::ACTIVE) {
+    if (horizontal_valid && has_prediction && previous_horizontal_health == SensorHealthState::ACTIVE) {
         // NC-IC extension: test the measurement in the current online frame.
         // After recovery this includes the fixed deviation term; a new large
         // mismatch therefore starts a fresh degraded/recovery episode.
@@ -715,13 +945,17 @@ bool GVINS::prepareGnssForOnlineFusion() {
         vertical_error = std::abs(innovation[2]);
         if (horizontal_error > gnss_horizontal_innovation_threshold_) {
             horizontal_valid = false;
-            LOGW << "NC-IC marks horizontal GNSS degraded by online innovation: " << horizontal_error;
+            horizontal_reasons.emplace_back(
+                absl::StrFormat("horizontal innovation %.3lf m exceeds %.3lf m",
+                                horizontal_error, gnss_horizontal_innovation_threshold_));
         }
         if (vertical_valid && (vertical_error > gnss_vertical_innovation_threshold_)) {
             // NC-IC extension: a vertical innovation no longer removes good
             // horizontal GNSS; it disables only the height row in the factor.
             vertical_valid = false;
-            LOGW << "NC-IC disables GNSS height by vertical innovation: " << vertical_error;
+            vertical_reasons.emplace_back(
+                absl::StrFormat("vertical innovation %.3lf m exceeds %.3lf m",
+                                vertical_error, gnss_vertical_innovation_threshold_));
         }
     }
 
@@ -736,15 +970,31 @@ bool GVINS::prepareGnssForOnlineFusion() {
     gnss_.vertical_health_state = decision.vertical.state;
     gnss_.horizontal_valid = decision.horizontal.accepted;
     gnss_.vertical_valid = decision.vertical.accepted;
+    const std::string horizontal_degrade_reason = joinReasons(horizontal_reasons);
+    const std::string vertical_degrade_reason = joinReasons(vertical_reasons);
+    const std::string horizontal_recovery_reason =
+        absl::StrFormat("valid horizontal GNSS accepted by recovery gate, samples=%d, innovation=%.3lf m",
+                        decision.horizontal.recovery_samples, horizontal_error);
+    const std::string vertical_recovery_reason =
+        absl::StrFormat("valid vertical GNSS accepted by recovery gate, samples=%d, innovation=%.3lf m",
+                        decision.vertical.recovery_samples, vertical_error);
+    logSensorHealthTransition("GNSS horizontal", previous_horizontal_health,
+                              decision.horizontal.state, horizontal_degrade_reason,
+                              horizontal_recovery_reason, gnss_.time);
+    logSensorHealthTransition("GNSS vertical", previous_vertical_health,
+                              decision.vertical.state, vertical_degrade_reason,
+                              vertical_recovery_reason, gnss_.time);
+    emitHealthStatus(gnss_.time);
 
     if (decision.state == SensorHealthState::DEGRADED &&
-        previous_health == SensorHealthState::ACTIVE) {
-        beginRecoverySegment(gnss_.time);
+        previous_horizontal_health == SensorHealthState::ACTIVE) {
+        beginRecoverySegment(gnss_.time, horizontal_degrade_reason);
     }
 
     const bool is_recovery_candidate =
         horizontal_valid && has_prediction &&
-        (previous_health == SensorHealthState::DEGRADED || previous_health == SensorHealthState::RECOVERING);
+        (previous_horizontal_health == SensorHealthState::DEGRADED ||
+         previous_horizontal_health == SensorHealthState::RECOVERING);
     if (is_recovery_candidate) {
         recovery_alignment_pairs_.emplace_back(gnss_.raw_local, predictedAntennaPosition());
         estimateRecoveryDeviation();
@@ -785,9 +1035,13 @@ bool GVINS::prepareGnssForOnlineFusion() {
     }
 
     if (decision.state == SensorHealthState::ACTIVE &&
-        (previous_health == SensorHealthState::RECOVERING ||
-         previous_health == SensorHealthState::DEGRADED) &&
+        (previous_horizontal_health == SensorHealthState::RECOVERING ||
+         previous_horizontal_health == SensorHealthState::DEGRADED) &&
         recovery_deviation_.valid) {
+        LOGW << "NC-IC sensor recovered: sensor=GNSS, condition="
+             << horizontal_recovery_reason
+             << ", time=" << Logging::doubleData(gnss_.time)
+             << ", recovery_segment=" << recovery_segment_id_;
         emitRecoveryEvent(RecoveryEventType::RECOVERY_CONFIRMED, gnss_.time);
         gnss_timeout_active_ = false;
         if (local_bootstrap_active_) {
@@ -1450,11 +1704,27 @@ bool GVINS::gvinsInitialization() {
     LOGI << "Initialization at " << Logging::doubleData(gnss_.time);
 
     if (nc_extension_enabled_) {
-        std::lock_guard<std::mutex> health_lock(health_mutex_);
+        SensorHealthState previous_horizontal_health;
+        SensorHealthState previous_vertical_health;
+        SensorHealthManager::Decision decision;
         // NC-IC extension: GNSS accepted for original IC initialization is
         // already trusted. Seed health so a following silent outage is
         // observable without waiting for another positioning packet.
-        gnss_health_manager_.updateGnss(gnss_.time, true, true);
+        {
+            std::lock_guard<std::mutex> health_lock(health_mutex_);
+            previous_horizontal_health = gnss_health_manager_.horizontalState();
+            previous_vertical_health = gnss_health_manager_.verticalState();
+            decision = gnss_health_manager_.updateGnss(gnss_.time, true, true);
+        }
+        logSensorHealthTransition(
+            "GNSS horizontal", previous_horizontal_health, decision.horizontal.state,
+            "GNSS was not usable before initialization",
+            "GNSS accepted for original IC initialization", gnss_.time);
+        logSensorHealthTransition(
+            "GNSS vertical", previous_vertical_health, decision.vertical.state,
+            "GNSS height was not usable before initialization",
+            "GNSS height accepted for original IC initialization", gnss_.time);
+        emitHealthStatus(gnss_.time);
     }
 
     // 加入当前GNSS时间节点
@@ -2031,14 +2301,34 @@ bool GVINS::gvinsOptimization() {
                                              static_cast<double>(residual_ids.size());
             report.valid = report.residual_count >= visual_min_residuals_ &&
                            report.outlier_ratio <= visual_max_outlier_ratio_;
-            std::lock_guard<std::mutex> health_lock(health_mutex_);
-            const auto decision =
-                gnss_health_manager_.updateVision(report.time, report.valid, report.outlier_ratio);
-            visual_factor_std_scale_ = decision.covariance_scale;
-            if (decision.health.state != SensorHealthState::ACTIVE) {
-                LOGW << "NC-IC downweights visual modality, outlier ratio "
-                     << report.outlier_ratio << ", residuals " << report.residual_count;
+            SensorHealthState previous_visual_health;
+            ModalityDecision decision;
+            {
+                std::lock_guard<std::mutex> health_lock(health_mutex_);
+                previous_visual_health = gnss_health_manager_.visionState();
+                decision =
+                    gnss_health_manager_.updateVision(report.time, report.valid, report.outlier_ratio);
             }
+            visual_factor_std_scale_ = decision.covariance_scale;
+            std::vector<std::string> visual_reasons;
+            if (report.residual_count < visual_min_residuals_) {
+                visual_reasons.emplace_back(
+                    absl::StrFormat("visual residual count %d below %d",
+                                    report.residual_count, visual_min_residuals_));
+            }
+            if (report.outlier_ratio > visual_max_outlier_ratio_) {
+                visual_reasons.emplace_back(
+                    absl::StrFormat("visual outlier ratio %.3lf exceeds %.3lf",
+                                    report.outlier_ratio, visual_max_outlier_ratio_));
+            }
+            logSensorHealthTransition(
+                "vision", previous_visual_health, decision.health.state,
+                joinReasons(visual_reasons),
+                absl::StrFormat("visual residuals %d and outlier ratio %.3lf passed recovery gate, samples=%d",
+                                report.residual_count, report.outlier_ratio,
+                                decision.health.recovery_samples),
+                report.time);
+            emitHealthStatus(report.time);
         }
 
         // Remove all GNSS factors

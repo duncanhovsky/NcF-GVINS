@@ -32,7 +32,9 @@
 #include <yaml-cpp/yaml.h>
 
 #include <boost/filesystem.hpp>
+#include <geometry_msgs/Point32.h>
 #include <sensor_msgs/image_encodings.h>
+#include <visualization_msgs/Marker.h>
 #include <opencv2/imgproc.hpp>
 
 #include <atomic>
@@ -40,11 +42,84 @@
 #include <cmath>
 #include <csignal>
 #include <memory>
+#include <sstream>
 
 std::atomic<bool> isfinished{false};
 
 void sigintHandler(int sig);
 void checkStateThread(std::shared_ptr<FusionROS> fusion);
+
+namespace {
+
+const char *healthStateText(SensorHealthState state, bool enabled) {
+    if (!enabled) {
+        return "DISABLED";
+    }
+    switch (state) {
+    case SensorHealthState::UNAVAILABLE:
+        return "UNAVAILABLE";
+    case SensorHealthState::ACTIVE:
+        return "NORMAL";
+    case SensorHealthState::DEGRADED:
+        return "DEGRADED";
+    case SensorHealthState::RECOVERING:
+        return "RECOVERING";
+    }
+    return "UNKNOWN";
+}
+
+void setHealthMarkerColor(visualization_msgs::Marker &marker,
+                          SensorHealthState state, bool enabled) {
+    marker.color.a = 1.0F;
+    if (!enabled || state == SensorHealthState::UNAVAILABLE) {
+        marker.color.r = 0.62F;
+        marker.color.g = 0.62F;
+        marker.color.b = 0.62F;
+        return;
+    }
+    if (state == SensorHealthState::ACTIVE) {
+        marker.color.r = 0.18F;
+        marker.color.g = 0.95F;
+        marker.color.b = 0.28F;
+        return;
+    }
+    if (state == SensorHealthState::DEGRADED) {
+        marker.color.r = 1.0F;
+        marker.color.g = 0.78F;
+        marker.color.b = 0.0F;
+        return;
+    }
+    if (state == SensorHealthState::RECOVERING) {
+        marker.color.r = 0.0F;
+        marker.color.g = 0.82F;
+        marker.color.b = 1.0F;
+        return;
+    }
+    marker.color.r = 1.0F;
+    marker.color.g = 0.25F;
+    marker.color.b = 0.25F;
+}
+
+visualization_msgs::Marker makeHealthTextMarker(
+    int id, const std::string &text, double x, double y, double z, double scale) {
+    visualization_msgs::Marker marker;
+    marker.header.stamp = ros::Time::now();
+    marker.header.frame_id = "map";
+    marker.ns = "sensor_health_panel";
+    marker.id = id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position.x = x;
+    marker.pose.position.y = y;
+    marker.pose.position.z = z;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = scale;
+    marker.text = text;
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+}
+
+} // namespace
 
 void FusionROS::setFinished() {
     if (gvins_ && gvins_->isRunning()) {
@@ -146,6 +221,13 @@ void FusionROS::run() {
         gvins_->setRecoveryEventCallback(
             [this](const RecoveryEventData &event) { publishRecoveryEvent(event); });
     }
+    gnss_measurement_pub_ = nh.advertise<sensor_msgs::PointCloud>("gnss_measurements", 2);
+    sensor_health_panel_pub_ =
+        nh.advertise<visualization_msgs::MarkerArray>("sensor_health_panel", 2, true);
+    gvins_->setGnssMeasurementCallback(
+        [this](const GNSS &gnss) { publishGnssMeasurement(gnss); });
+    gvins_->setHealthStatusCallback(
+        [this](const SensorHealthStatusData &status) { publishSensorHealthStatus(status); });
 
     // subscribe message
     ros::Subscriber imu_sub   = nh.subscribe<sensor_msgs::Imu>(imu_topic, 200, &FusionROS::imuCallback, this);
@@ -253,6 +335,86 @@ void FusionROS::gnssCallback(const sensor_msgs::NavSatFixConstPtr &gnssmsg) {
         // Original IC-GVINS behaviour retained for regression configuration.
         gvins_->addNewGnss(gnss_);
     }
+}
+
+void FusionROS::publishGnssMeasurement(const GNSS &gnss) {
+    if (!gnss.raw_local.allFinite()) {
+        return;
+    }
+    if (gnss_measurements_.channels.empty()) {
+        gnss_measurements_.header.frame_id = "map";
+        gnss_measurements_.channels.resize(3);
+        gnss_measurements_.channels[0].name = "horizontal_valid";
+        gnss_measurements_.channels[1].name = "vertical_valid";
+        gnss_measurements_.channels[2].name = "forced_degraded";
+    }
+
+    geometry_msgs::Point32 point;
+    point.x = static_cast<float>(gnss.raw_local.x());
+    point.y = static_cast<float>(gnss.raw_local.y());
+    point.z = static_cast<float>(gnss.raw_local.z());
+
+    gnss_measurements_.header.stamp = ros::Time::now();
+    gnss_measurements_.points.push_back(point);
+    gnss_measurements_.channels[0].values.push_back(gnss.horizontal_valid ? 1.0F : 0.0F);
+    gnss_measurements_.channels[1].values.push_back(gnss.vertical_valid ? 1.0F : 0.0F);
+    gnss_measurements_.channels[2].values.push_back(gnss.forced_degraded ? 1.0F : 0.0F);
+
+    gnss_measurement_pub_.publish(gnss_measurements_);
+}
+
+void FusionROS::publishSensorHealthStatus(const SensorHealthStatusData &status) {
+    const ros::WallTime now = ros::WallTime::now();
+    if (has_sensor_health_panel_time_ &&
+        (now - last_sensor_health_panel_time_).toSec() < 0.2) {
+        return;
+    }
+    last_sensor_health_panel_time_ = now;
+    has_sensor_health_panel_time_ = true;
+
+    visualization_msgs::MarkerArray markers;
+    const double x = 0.0;
+    const double y = -6.0;
+    const double z = 6.0;
+    const double step = 0.55;
+
+    auto title = makeHealthTextMarker(0, "NcF-GVINS Sensor Health", x, y, z, 0.42);
+    title.color.r = 1.0F;
+    title.color.g = 1.0F;
+    title.color.b = 1.0F;
+    title.color.a = 1.0F;
+    markers.markers.push_back(title);
+
+    std::ostringstream detail;
+    detail << "NC=" << (status.nc_extension_enabled ? "ON" : "OFF")
+           << "  t=" << Logging::doubleData(status.time)
+           << "  segment=" << status.recovery_segment_id
+           << (status.recovery_deviation_valid ? " aligned" : "");
+    auto detail_marker = makeHealthTextMarker(1, detail.str(), x, y, z - step, 0.32);
+    detail_marker.color.r = 0.80F;
+    detail_marker.color.g = 0.84F;
+    detail_marker.color.b = 0.90F;
+    detail_marker.color.a = 1.0F;
+    markers.markers.push_back(detail_marker);
+
+    auto add_status_line = [&](int id, const std::string &name, bool enabled,
+                               SensorHealthState state) {
+        std::ostringstream text;
+        text << name << ": " << healthStateText(state, enabled);
+        auto marker = makeHealthTextMarker(id, text.str(), x, y, z - step * id, 0.36);
+        setHealthMarkerColor(marker, state, enabled);
+        markers.markers.push_back(marker);
+    };
+
+    add_status_line(2, "IMU", status.imu_enabled, status.imu_state);
+    add_status_line(3, "GNSS horizontal", status.gnss_enabled,
+                    status.gnss_horizontal_state);
+    add_status_line(4, "GNSS vertical", status.gnss_enabled,
+                    status.gnss_vertical_state);
+    add_status_line(5, "Vision", status.vision_enabled, status.vision_state);
+    add_status_line(6, "Heading", status.heading_enabled, status.heading_state);
+
+    sensor_health_panel_pub_.publish(markers);
 }
 
 void FusionROS::publishRecoveryFrame(const RecoveryFrameData &frame) {

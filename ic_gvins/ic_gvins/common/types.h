@@ -155,6 +155,23 @@ typedef struct RecoveryEventData {
     RecoveryDeviation deviation;
 } RecoveryEventData;
 
+// NC-IC extension: compact health snapshot for ROS/RViz diagnostics.
+typedef struct SensorHealthStatusData {
+    double time{0};
+    bool nc_extension_enabled{false};
+    bool imu_enabled{true};
+    bool gnss_enabled{true};
+    bool vision_enabled{true};
+    bool heading_enabled{false};
+    SensorHealthState imu_state{SensorHealthState::UNAVAILABLE};
+    SensorHealthState gnss_horizontal_state{SensorHealthState::UNAVAILABLE};
+    SensorHealthState gnss_vertical_state{SensorHealthState::UNAVAILABLE};
+    SensorHealthState vision_state{SensorHealthState::UNAVAILABLE};
+    SensorHealthState heading_state{SensorHealthState::UNAVAILABLE};
+    int recovery_segment_id{-1};
+    bool recovery_deviation_valid{false};
+} SensorHealthStatusData;
+
 // NC-IC extension: heading is a calibrated yaw observation interface.  Raw
 // magnetometer calibration is intentionally outside the estimator, allowing
 // the current datasets to leave this disabled without changing behaviour.

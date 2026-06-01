@@ -75,8 +75,12 @@ public:
     // sliding window or changing the original real-time propagation thread.
     using RecoveryFrameCallback = std::function<void(const RecoveryFrameData &)>;
     using RecoveryEventCallback = std::function<void(const RecoveryEventData &)>;
+    using GnssMeasurementCallback = std::function<void(const GNSS &)>;
+    using HealthStatusCallback = std::function<void(const SensorHealthStatusData &)>;
     void setRecoveryFrameCallback(RecoveryFrameCallback callback);
     void setRecoveryEventCallback(RecoveryEventCallback callback);
+    void setGnssMeasurementCallback(GnssMeasurementCallback callback);
+    void setHealthStatusCallback(HealthStatusCallback callback);
 
     void setFinished();
 
@@ -119,11 +123,13 @@ private:
     void checkGnssTimeout(double fusion_time);
     Vector3d predictedAntennaPosition() const;
     Vector3d adjustedOnlineGnssMeasurement(const GNSS &gnss) const;
-    void beginRecoverySegment(double time);
+    void beginRecoverySegment(double time, const string &reason);
     bool estimateRecoveryDeviation();
     void emitRecoveryFrames();
     void emitRecoveryAnchor(const GNSS &gnss);
     void emitRecoveryEvent(RecoveryEventType type, double time);
+    void emitGnssMeasurement(const GNSS &gnss);
+    void emitHealthStatus(double time);
 
     int getStateDataIndex(double time);
 
@@ -287,7 +293,11 @@ private:
 
     RecoveryFrameCallback recovery_frame_callback_;
     RecoveryEventCallback recovery_event_callback_;
+    GnssMeasurementCallback gnss_measurement_callback_;
+    HealthStatusCallback health_status_callback_;
     std::mutex recovery_callback_mutex_;
+    std::mutex gnss_measurement_callback_mutex_;
+    std::mutex health_status_callback_mutex_;
     std::unordered_map<std::uint64_t, std::uint32_t> recovery_frame_revisions_;
 
     std::queue<Frame::Ptr> frame_buffer_;
