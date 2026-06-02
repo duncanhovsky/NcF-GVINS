@@ -10,11 +10,15 @@
 #include <ic_gvins/RecoveryEvent.h>
 #include <ic_gvins/RecoveryFrame.h>
 
+#include "reloc_segment_lifecycle.h"
+
 #include <ceres/ceres.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <nav_msgs/Path.h>
 #include <ros/ros.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -24,6 +28,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -68,6 +73,19 @@ struct RelocNodeData {
     int health_state{0};
     Eigen::Vector3d raw_gnss{0, 0, 0};
     Eigen::Vector3d gnss_std{1, 1, 1};
+};
+
+struct MapCorrection {
+    Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d translation = Eigen::Vector3d::Zero();
+};
+
+struct SegmentResult {
+    int segment_id{-1};
+    double start_time{0};
+    double end_time{0};
+    MapCorrection correction;
+    std::map<std::uint64_t, geometry_msgs::PoseStamped> optimized_poses;
 };
 
 struct RelativeFourDofFactor {
@@ -159,14 +177,33 @@ public:
         private_node_.param("relative_yaw_std_deg", relative_yaw_std_deg_, 1.0);
         private_node_.param("relative_reference_interval", relative_reference_interval_, 0.5);
         private_node_.param("maximum_nodes", maximum_nodes_, 5000);
+        private_node_.param("maximum_visualization_nodes", maximum_visualization_nodes_, 20000);
+        private_node_.param("min_recovery_anchors", min_recovery_anchors_, 10);
+        private_node_.param("max_recovery_tail_duration", max_recovery_tail_duration_, 10.0);
+        private_node_.param("optimize_num_iterations", optimize_num_iterations_, 20);
+        private_node_.param("tf_publish_rate", tf_publish_rate_, 20.0);
+
+        nc_reloc::RelocSegmentLifecycle<RelocNodeData>::Options lifecycle_options;
+        lifecycle_options.maximum_nodes = static_cast<std::size_t>(maximum_nodes_);
+        lifecycle_options.min_recovery_anchors = min_recovery_anchors_;
+        lifecycle_options.max_recovery_tail_duration = max_recovery_tail_duration_;
+        lifecycle_ = nc_reloc::RelocSegmentLifecycle<RelocNodeData>(lifecycle_options);
 
         frame_subscriber_ =
             node_.subscribe("recovery_frame", 200, &DegradedRelocNode::frameCallback, this);
         event_subscriber_ =
             node_.subscribe("recovery_event", 20, &DegradedRelocNode::eventCallback, this);
         global_path_publisher_ = node_.advertise<nav_msgs::Path>("global_path", 2);
+        path_map_publisher_ = node_.advertise<nav_msgs::Path>("path_map", 2);
         map_to_odom_publisher_ =
             node_.advertise<geometry_msgs::TransformStamped>("map_to_odom", 2);
+        reloc_segments_publisher_ =
+            node_.advertise<visualization_msgs::MarkerArray>("reloc_segments", 2);
+
+        if (tf_publish_rate_ > 0.0) {
+            tf_timer_ = node_.createTimer(ros::Duration(1.0 / tf_publish_rate_),
+                                          &DegradedRelocNode::tfTimerCallback, this);
+        }
 
         worker_ = std::thread(&DegradedRelocNode::process, this);
     }
@@ -218,32 +255,28 @@ private:
                                         std::max(message->gnss_std[2], 1.0e-3));
 
         bool should_notify = false;
+        bool should_publish_path = false;
+        nav_msgs::Path combined_path;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const auto existing = nodes_.find(data.node_id);
-            if (existing != nodes_.end() && existing->second.revision > data.revision) {
+            const auto existing = all_nodes_.find(data.node_id);
+            if (existing != all_nodes_.end() && existing->second.revision > data.revision) {
                 return;
             }
-            nodes_[data.node_id] = data;
-            while (nodes_.size() > static_cast<size_t>(maximum_nodes_)) {
-                nodes_.erase(nodes_.begin());
+            all_nodes_[data.node_id] = data;
+            while (all_nodes_.size() > static_cast<size_t>(maximum_visualization_nodes_)) {
+                all_nodes_.erase(all_nodes_.begin());
             }
-            if (data.segment_id >= 0) {
-                auto &segment = segment_nodes_[data.segment_id];
-                const auto segment_existing = segment.find(data.node_id);
-                if (segment_existing == segment.end() ||
-                    segment_existing->second.revision <= data.revision) {
-                    segment[data.node_id] = data;
-                }
-                while (segment.size() > static_cast<size_t>(maximum_nodes_)) {
-                    segment.erase(segment.begin());
-                }
-            }
-            // NC-IC extension: node packets now update graph data only.  The
-            // event stream explicitly controls recovery lifecycle rather than
-            // guessing it from a non-zero online deviation.
-            pending_ = relocation_active_;
-            should_notify = relocation_active_;
+
+            lifecycle_.addNode(data);
+            pending_ = lifecycle_.hasReady();
+            should_notify = pending_;
+            combined_path = buildCombinedPathLocked(ros::Time::now());
+            should_publish_path = !combined_path.poses.empty();
+        }
+        if (should_publish_path) {
+            global_path_publisher_.publish(combined_path);
+            path_map_publisher_.publish(combined_path);
         }
         if (should_notify) {
             condition_.notify_one();
@@ -254,18 +287,28 @@ private:
         bool should_notify = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (message->event_type == 0) {
-                active_segment_id_ = message->segment_id;
-                segment_seen_ = true;
-            } else if ((message->event_type == 1 || message->event_type == 3) &&
-                       (active_segment_id_ < 0 || message->segment_id == active_segment_id_)) {
-                // NC-IC extension: only a confirmed recovery/global alignment
-                // allows raw GNSS to correct the archived degraded segment.
-                active_segment_id_ = message->segment_id;
-                relocation_active_ = true;
-                pending_ = true;
+            switch (message->event_type) {
+            case 0:
+                lifecycle_.handleEvent(nc_reloc::RecoveryEventKind::DegradedStart,
+                                       message->segment_id, message->gps_time);
+                break;
+            case 1:
+                lifecycle_.handleEvent(nc_reloc::RecoveryEventKind::RecoveryConfirmed,
+                                       message->segment_id, message->gps_time);
+                break;
+            case 2:
+                lifecycle_.handleEvent(nc_reloc::RecoveryEventKind::SegmentClosed,
+                                       message->segment_id, message->gps_time);
+                break;
+            case 3:
+                lifecycle_.handleEvent(nc_reloc::RecoveryEventKind::GlobalAligned,
+                                       message->segment_id, message->gps_time);
+                break;
+            default:
+                break;
             }
-            should_notify = relocation_active_;
+            pending_ = lifecycle_.hasReady();
+            should_notify = pending_;
         }
         if (should_notify) {
             condition_.notify_one();
@@ -275,27 +318,40 @@ private:
     void process() {
         while (ros::ok()) {
             std::vector<RelocNodeData> snapshot;
+            int segment_id = -1;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [this]() { return pending_; });
+                condition_.wait(lock, [this]() { return pending_ || finished_; });
                 if (finished_) {
                     return;
                 }
                 pending_ = false;
-                const auto active = segment_nodes_.find(active_segment_id_);
-                if (active != segment_nodes_.end()) {
-                    for (const auto &node : active->second) {
-                        snapshot.push_back(node.second);
-                    }
+                if (!lifecycle_.popReadySnapshot(segment_id, snapshot)) {
+                    continue;
                 }
             }
-            optimizeAndPublish(snapshot);
+            const bool solved = optimizeAndPublish(segment_id, snapshot);
+
+            bool should_notify = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (solved) {
+                    lifecycle_.markSolved(segment_id);
+                } else {
+                    lifecycle_.markFailed(segment_id);
+                }
+                pending_ = lifecycle_.hasReady();
+                should_notify = pending_;
+            }
+            if (should_notify) {
+                condition_.notify_one();
+            }
         }
     }
 
-    void optimizeAndPublish(const std::vector<RelocNodeData> &nodes) {
+    bool optimizeAndPublish(int segment_id, const std::vector<RelocNodeData> &nodes) {
         if (nodes.size() < 2) {
-            return;
+            return false;
         }
 
         size_t gnss_anchors = 0;
@@ -304,8 +360,8 @@ private:
                 gnss_anchors++;
             }
         }
-        if (gnss_anchors == 0) {
-            return;
+        if (gnss_anchors < static_cast<size_t>(std::max(min_recovery_anchors_, 1))) {
+            return false;
         }
 
         std::vector<std::array<double, 3>> positions(nodes.size());
@@ -360,64 +416,201 @@ private:
 
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        options.max_num_iterations = 20;
+        options.max_num_iterations = optimize_num_iterations_;
         options.num_threads = 1;
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
+        if (!summary.IsSolutionUsable()) {
+            return false;
+        }
 
-        publishResult(nodes, positions, yaws);
+        publishResult(segment_id, nodes, positions, yaws);
+        return true;
     }
 
-    void publishResult(const std::vector<RelocNodeData> &nodes,
+    void publishResult(int segment_id, const std::vector<RelocNodeData> &nodes,
                        const std::vector<std::array<double, 3>> &positions,
                        const std::vector<double> &yaws) {
         const ros::Time stamp = ros::Time::now();
+        nav_msgs::Path combined_path;
+        visualization_msgs::MarkerArray segment_markers;
+        geometry_msgs::TransformStamped transform;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            SegmentResult result;
+            result.segment_id = segment_id;
+            result.start_time = nodes.front().time;
+            result.end_time = nodes.back().time;
+
+            const size_t last = nodes.size() - 1;
+            const double yaw_correction = yaws[last] - nodes[last].odom_yaw;
+            result.correction.rotation =
+                Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+            result.correction.translation =
+                Eigen::Vector3d(positions[last][0], positions[last][1], positions[last][2]) -
+                result.correction.rotation * nodes[last].odom_position;
+
+            for (size_t i = 0; i < nodes.size(); i++) {
+                result.optimized_poses[nodes[i].node_id] =
+                    makeOptimizedPoseStamped(stamp, nodes[i], positions[i], yaws[i]);
+            }
+            segment_results_[segment_id] = result;
+            current_correction_ = result.correction;
+
+            combined_path = buildCombinedPathLocked(stamp);
+            segment_markers = buildSegmentMarkersLocked(stamp);
+            transform = makeMapToOdomTransformLocked(stamp);
+        }
+
+        global_path_publisher_.publish(combined_path);
+        path_map_publisher_.publish(combined_path);
+        reloc_segments_publisher_.publish(segment_markers);
+        map_to_odom_publisher_.publish(transform);
+        transform_broadcaster_.sendTransform(transform);
+    }
+
+    geometry_msgs::PoseStamped makeOptimizedPoseStamped(
+        const ros::Time &stamp, const RelocNodeData &node,
+        const std::array<double, 3> &position, double yaw) const {
+        geometry_msgs::PoseStamped pose;
+        pose.header.stamp = stamp;
+        pose.header.frame_id = "map";
+        pose.pose.position.x = position[0];
+        pose.pose.position.y = position[1];
+        pose.pose.position.z = position[2];
+
+        const double correction_yaw = yaw - node.odom_yaw;
+        const Eigen::Quaterniond orientation =
+            Eigen::AngleAxisd(correction_yaw, Eigen::Vector3d::UnitZ()) *
+            node.odom_orientation;
+        pose.pose.orientation.x = orientation.x();
+        pose.pose.orientation.y = orientation.y();
+        pose.pose.orientation.z = orientation.z();
+        pose.pose.orientation.w = orientation.w();
+        return pose;
+    }
+
+    geometry_msgs::PoseStamped transformNodePoseLocked(
+        const ros::Time &stamp, const RelocNodeData &node,
+        const MapCorrection &correction) const {
+        geometry_msgs::PoseStamped pose;
+        pose.header.stamp = stamp;
+        pose.header.frame_id = "map";
+
+        const Eigen::Vector3d position =
+            correction.rotation * node.odom_position + correction.translation;
+        const Eigen::Quaterniond orientation =
+            Eigen::Quaterniond(correction.rotation) * node.odom_orientation;
+        pose.pose.position.x = position.x();
+        pose.pose.position.y = position.y();
+        pose.pose.position.z = position.z();
+        pose.pose.orientation.x = orientation.x();
+        pose.pose.orientation.y = orientation.y();
+        pose.pose.orientation.z = orientation.z();
+        pose.pose.orientation.w = orientation.w();
+        return pose;
+    }
+
+    MapCorrection correctionForTimeLocked(double time) const {
+        MapCorrection correction;
+        double latest_result_end_time = -std::numeric_limits<double>::infinity();
+        for (const auto &result : segment_results_) {
+            if (result.second.end_time <= time &&
+                result.second.end_time >= latest_result_end_time) {
+                correction = result.second.correction;
+                latest_result_end_time = result.second.end_time;
+            }
+        }
+        return correction;
+    }
+
+    nav_msgs::Path buildCombinedPathLocked(const ros::Time &stamp) const {
         nav_msgs::Path path;
         path.header.stamp = stamp;
         path.header.frame_id = "map";
 
-        for (size_t i = 0; i < nodes.size(); i++) {
-            geometry_msgs::PoseStamped pose;
-            pose.header = path.header;
-            pose.pose.position.x = positions[i][0];
-            pose.pose.position.y = positions[i][1];
-            pose.pose.position.z = positions[i][2];
-
-            const double correction_yaw = yaws[i] - nodes[i].odom_yaw;
-            const Eigen::Quaterniond orientation =
-                Eigen::AngleAxisd(correction_yaw, Eigen::Vector3d::UnitZ()) * nodes[i].odom_orientation;
-            pose.pose.orientation.x = orientation.x();
-            pose.pose.orientation.y = orientation.y();
-            pose.pose.orientation.z = orientation.z();
-            pose.pose.orientation.w = orientation.w();
-            path.poses.push_back(pose);
+        for (const auto &node_entry : all_nodes_) {
+            const RelocNodeData &node = node_entry.second;
+            bool used_optimized_pose = false;
+            for (const auto &result : segment_results_) {
+                const auto pose = result.second.optimized_poses.find(node.node_id);
+                if (pose != result.second.optimized_poses.end()) {
+                    geometry_msgs::PoseStamped stamped_pose = pose->second;
+                    stamped_pose.header.stamp = stamp;
+                    path.poses.push_back(stamped_pose);
+                    used_optimized_pose = true;
+                    break;
+                }
+            }
+            if (!used_optimized_pose) {
+                path.poses.push_back(
+                    transformNodePoseLocked(stamp, node, correctionForTimeLocked(node.time)));
+            }
         }
-        global_path_publisher_.publish(path);
+        return path;
+    }
 
-        const size_t last = nodes.size() - 1;
-        const double yaw_correction = yaws[last] - nodes[last].odom_yaw;
-        const Eigen::Matrix3d rotation =
-            Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-        const Eigen::Vector3d translation =
-            Eigen::Vector3d(positions[last][0], positions[last][1], positions[last][2]) -
-            rotation * nodes[last].odom_position;
-        const Eigen::Quaterniond quaternion(rotation);
+    visualization_msgs::MarkerArray buildSegmentMarkersLocked(const ros::Time &stamp) const {
+        visualization_msgs::MarkerArray markers;
+        visualization_msgs::Marker clear;
+        clear.header.stamp = stamp;
+        clear.header.frame_id = "map";
+        clear.action = visualization_msgs::Marker::DELETEALL;
+        markers.markers.push_back(clear);
 
+        int marker_id = 0;
+        for (const auto &result_entry : segment_results_) {
+            visualization_msgs::Marker marker;
+            marker.header.stamp = stamp;
+            marker.header.frame_id = "map";
+            marker.ns = "reloc_segments";
+            marker.id = marker_id++;
+            marker.type = visualization_msgs::Marker::LINE_STRIP;
+            marker.action = visualization_msgs::Marker::ADD;
+            marker.scale.x = 0.08;
+            marker.color.a = 1.0;
+            marker.color.r = 0.20 + 0.20 * (marker.id % 3);
+            marker.color.g = 0.85 - 0.15 * (marker.id % 2);
+            marker.color.b = 1.0 - 0.20 * (marker.id % 4);
+
+            for (const auto &pose_entry : result_entry.second.optimized_poses) {
+                geometry_msgs::Point point;
+                point.x = pose_entry.second.pose.position.x;
+                point.y = pose_entry.second.pose.position.y;
+                point.z = pose_entry.second.pose.position.z;
+                marker.points.push_back(point);
+            }
+            if (!marker.points.empty()) {
+                markers.markers.push_back(marker);
+            }
+        }
+        return markers;
+    }
+
+    geometry_msgs::TransformStamped makeMapToOdomTransformLocked(const ros::Time &stamp) const {
         geometry_msgs::TransformStamped transform;
         transform.header.stamp = stamp;
         transform.header.frame_id = "map";
         transform.child_frame_id = "odom";
-        transform.transform.translation.x = translation.x();
-        transform.transform.translation.y = translation.y();
-        transform.transform.translation.z = translation.z();
+        transform.transform.translation.x = current_correction_.translation.x();
+        transform.transform.translation.y = current_correction_.translation.y();
+        transform.transform.translation.z = current_correction_.translation.z();
+        const Eigen::Quaterniond quaternion(current_correction_.rotation);
         transform.transform.rotation.x = quaternion.x();
         transform.transform.rotation.y = quaternion.y();
         transform.transform.rotation.z = quaternion.z();
         transform.transform.rotation.w = quaternion.w();
+        return transform;
+    }
+
+    void tfTimerCallback(const ros::TimerEvent &) {
+        geometry_msgs::TransformStamped transform;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            transform = makeMapToOdomTransformLocked(ros::Time::now());
+        }
         map_to_odom_publisher_.publish(transform);
-        // NC-IC extension: expose the same correction as TF so consumers can
-        // render smooth odom output in the corrected map frame without any
-        // reset of IC-GVINS internal states.
         transform_broadcaster_.sendTransform(transform);
     }
 
@@ -427,7 +620,10 @@ private:
     ros::Subscriber frame_subscriber_;
     ros::Subscriber event_subscriber_;
     ros::Publisher global_path_publisher_;
+    ros::Publisher path_map_publisher_;
     ros::Publisher map_to_odom_publisher_;
+    ros::Publisher reloc_segments_publisher_;
+    ros::Timer tf_timer_;
     tf2_ros::TransformBroadcaster transform_broadcaster_;
 
     std::mutex mutex_;
@@ -435,16 +631,20 @@ private:
     std::thread worker_;
     bool finished_{false};
     bool pending_{false};
-    bool segment_seen_{false};
-    bool relocation_active_{false};
-    int active_segment_id_{-1};
-    std::map<std::uint64_t, RelocNodeData> nodes_;
-    std::map<int, std::map<std::uint64_t, RelocNodeData>> segment_nodes_;
+    nc_reloc::RelocSegmentLifecycle<RelocNodeData> lifecycle_;
+    std::map<std::uint64_t, RelocNodeData> all_nodes_;
+    std::map<int, SegmentResult> segment_results_;
+    MapCorrection current_correction_;
 
     double relative_position_std_{0.15};
     double relative_yaw_std_deg_{1.0};
     double relative_reference_interval_{0.5};
     int maximum_nodes_{5000};
+    int maximum_visualization_nodes_{20000};
+    int min_recovery_anchors_{10};
+    double max_recovery_tail_duration_{10.0};
+    int optimize_num_iterations_{20};
+    double tf_publish_rate_{20.0};
 };
 
 int main(int argc, char **argv) {

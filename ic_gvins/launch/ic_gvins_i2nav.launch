@@ -15,6 +15,11 @@
         <param name="relative_yaw_std_deg" value="1.0"/>
         <param name="relative_reference_interval" value="0.5"/>
         <param name="maximum_nodes" value="5000"/>
+        <param name="maximum_visualization_nodes" value="20000"/>
+        <param name="min_recovery_anchors" value="10"/>
+        <param name="max_recovery_tail_duration" value="10.0"/>
+        <param name="optimize_num_iterations" value="20"/>
+        <param name="tf_publish_rate" value="20.0"/>
     </node>
 
     <node pkg="image_transport" type="republish" name="republish_left"
