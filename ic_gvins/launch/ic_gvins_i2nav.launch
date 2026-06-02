@@ -4,7 +4,7 @@
 
     <node name="ic_gvins_node" pkg="ic_gvins" type="ic_gvins_ros" output="screen">
         <param name="imu_topic" value="/adi/adis16465/imu"/>
-        <param name="gnss_topic" value="/gnss/fix"/>
+        <param name="gnss_topic" value="/ublox/f9p/fix"/>
         <param name="image_topic" value="/avt_camera/left/image"/>
         <param name="configfile" value="$(arg configfile)"/>
     </node>
@@ -17,6 +17,9 @@
         <param name="maximum_nodes" value="5000"/>
     </node>
 
+    <node pkg="image_transport" type="republish" name="republish_left"
+      output="screen"
+      args="compressed in:=/avt_camera/left/image raw out:=/avt_camera/left/image"/>
     <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_map_broadcaster"
           args="0 0 0 -1 0 0 0 map world"/>
     <node name="visualisation" pkg="rviz" type="rviz" output="log"

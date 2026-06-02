@@ -9,7 +9,7 @@
 # - VINS-Fusion IMU noise fields are kept in sensor_profile for traceability;
 #   imumodel below uses the IC-GVINS arw/vrw/bias convention.
 
-outputpath: "~/building00/NcF-GVINS"
+outputpath: "/home/dyishere/ncf_gvins_ws/output/building00/NcF-GVINS"
 is_make_outputdir: true
 
 sensor_profile:
@@ -17,7 +17,7 @@ sensor_profile:
     camera_type: "mono pinhole, AVT left camera"
     image_rate: 10
     imu_rate: 200
-    gnss_rate: 10
+    gnss_rate: 1
     magnetic_rate: 0
     source_vins_noise:
         acc_n: 0.1
@@ -44,7 +44,7 @@ imumodel:
 isusegnssoutage: false
 gnssoutagetime: 0
 gnssoutageendtime: 0
-gnssthreshold: 10
+gnssthreshold: 20
 
 nc_extension:
     enabled: true
@@ -56,10 +56,10 @@ nc_extension:
     vertical_recovery_confirm_duration: 1.0
     # i2Nav GNSS is configured as 10 Hz. This is a configured silence timeout,
     # not online rate estimation.
-    gnss_timeout: 0.5
-    gnss_horizontal_innovation_threshold: 10.0
-    gnss_vertical_innovation_threshold: 20.0
-    recovery_min_horizontal_baseline: 5.0
+    gnss_timeout: 5.0
+    gnss_horizontal_innovation_threshold: 20.0
+    gnss_vertical_innovation_threshold: 30.0
+    recovery_min_horizontal_baseline: 10.0
     recovery_max_yaw_deg: 20.0
     startup_mode: "auto"
     enable_local_bootstrap: true
@@ -96,7 +96,7 @@ reprojection_error_std: 1.5
 optimize_windows_size: 10
 optimize_num_iterations: 20
 optimize_estimate_extrinsic: true
-optimize_estimate_td: false
+optimize_estimate_td: true
 
 cam0:
     intrinsic: [1064.8950, 1065.2546, 801.4049, 624.6878]
@@ -109,4 +109,4 @@ cam0:
     t_b_c: [0.1, -0.2, -0.054]
 
     # VINS-Fusion td: image clock + td = IMU clock.
-    td_b_c: 0.02
+    td_b_c: 0.0

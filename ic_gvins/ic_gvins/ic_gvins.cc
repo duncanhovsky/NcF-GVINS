@@ -746,10 +746,10 @@ Vector3d GVINS::predictedAntennaPosition() const {
     }
 
     IntegrationState state = ins_window_.back().second;
-    const size_t state_index = MISC::getInsWindowIndex(ins_window_, gnss.time);
+    const size_t state_index = MISC::getInsWindowIndex(ins_window_, gnss_.time);
     if (state_index > 0 && state_index < ins_window_.size()) {
         MISC::statePoseInterpolation(ins_window_[state_index - 1].second,
-                                     ins_window_[state_index].second, gnss.time, state);
+                                     ins_window_[state_index].second, gnss_.time, state);
     }
     return state.p + state.q.toRotationMatrix() * antlever_;
 }
