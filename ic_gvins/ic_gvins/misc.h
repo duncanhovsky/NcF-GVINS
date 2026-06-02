@@ -65,7 +65,8 @@ public:
 
     static void writeNavResult(const IntegrationConfiguration &config, const IntegrationState &state,
                                const FileSaver::Ptr &navfile, const FileSaver::Ptr &errfile,
-                               const FileSaver::Ptr &trajfile);
+                               const FileSaver::Ptr &trajfile, const FileSaver::Ptr &trajunixfile,
+                               bool has_gps_unix_offset, double gps_unix_offset);
 
 public:
     // 允许的时间对齐误差

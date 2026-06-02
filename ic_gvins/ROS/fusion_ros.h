@@ -62,6 +62,7 @@ private:
     void publishGnssMeasurement(const GNSS &gnss);
     void publishSensorHealthStatus(const SensorHealthStatusData &status);
     void headingCallback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &headingmsg);
+    void updateTimeReference(double unixsecond, double weeksec);
 
 private:
     std::shared_ptr<GVINS> gvins_;
@@ -78,6 +79,8 @@ private:
     bool enable_async_relocator_{false};
     bool use_magnetic_heading_{false};
     std::string heading_topic_{"/mag_heading"};
+    bool has_gps_unix_offset_{false};
+    double gps_unix_offset_{0.0};
 
     // NC-IC extension: optimized online snapshots are sent to a separate map
     // correction node; no relocation work runs in the real-time ROS wrapper.

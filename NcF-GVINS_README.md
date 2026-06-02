@@ -103,7 +103,7 @@ catkin_make -j8 -DCMAKE_BUILD_TYPE=Release \
 | `/map_to_odom` | `geometry_msgs/TransformStamped` | 当前 map 到在线 odom 的校正变换。 |
 | TF `map -> odom` | `tf2` | 与 `/map_to_odom` 相同的变换，便于 RViz 将平滑在线轨迹显示到全局 map 下。 |
 
-注意：当前异步重定位节点只发布 ROS 话题和 TF，不把 `/global_path` 另存为文件。需要离线评估全局校正轨迹时，可运行时录制：
+注意：当前异步重定位节点会把 `/global_path` 的最新完整轨迹写入 `global_path.csv` 和 `global_path_unix.csv`。如果还需要离线查看 TF 或完整 ROS 话题，可运行时录制：
 
 ```bash
 rosbag record /global_path /map_to_odom /tf
@@ -117,6 +117,9 @@ rosbag record /global_path /map_to_odom /tf
 | --- | --- |
 | `gvins.nav` | 导航结果。全局初始化时为纬度、经度、高程、速度、姿态；本地 bootstrap 时位置为米制局部 odom。 |
 | `trajectory.csv` | TUM 风格轨迹：`time p_x p_y p_z q_x q_y q_z q_w`。时间为 GPS week second。 |
+| `trajectory_unix.csv` | 与 `trajectory.csv` 相同的在线轨迹，第一列时间为 Unix time。 |
+| `global_path.csv` | 异步重定位 `/global_path` 的 8 列 TUM 风格轨迹，第一列时间为 GPS week second。 |
+| `global_path_unix.csv` | 与 `global_path.csv` 相同的全局校正轨迹，第一列时间为 Unix time。 |
 | `mappoint.txt` | 被保存的地图点。 |
 | `statistics.txt` | 滑窗长度、特征数、重投影误差、优化耗时、外点统计等。 |
 | `extrinsic.txt` | 在线估计的相机-IMU 外参和时间延迟。 |
@@ -420,7 +423,7 @@ evo_traj tum /path/to/NcF-GVINS/T20260601123000/trajectory.csv \
     --ref reference.tum -p --plot_mode xy
 ```
 
-异步重定位结果来自 `/global_path`，当前节点不会自动保存为文件。运行数据时先录制：
+异步重定位结果会自动写入输出目录中的 `global_path.csv` 和 `global_path_unix.csv`。如果还需要离线查看 `/global_path` 话题、`/map_to_odom` 或 TF，可运行时录制：
 
 ```bash
 rosbag record -O async_reloc_result.bag /global_path /map_to_odom /tf
@@ -432,15 +435,14 @@ rosbag record -O async_reloc_result.bag /global_path /map_to_odom /tf
 evo_traj bag async_reloc_result.bag /global_path -p --plot_mode xy
 ```
 
-若要对异步重定位结果计算 APE，先导出 `/global_path` 为 TUM 轨迹，再与参考轨迹评估。`--save_as_tum` 生成的文件名会打印在终端，下面以 `global_path.tum` 表示：
+若要对异步重定位结果计算 APE，可直接使用输出目录中的 `global_path.csv` 或 `global_path_unix.csv`，根据参考轨迹时间基准选择 GPS week second 或 Unix time：
 
 ```bash
-evo_traj bag async_reloc_result.bag /global_path --save_as_tum
-evo_ape tum reference.tum global_path.tum \
+evo_ape tum reference.tum /path/to/NcF-GVINS/T20260601123000/global_path.csv \
     -a -p --plot_mode xy --save_results async_reloc_ape.zip
 ```
 
-注意：`degraded_reloc_node.cc` 当前发布 `/global_path` 时使用 `ros::Time::now()` 作为 Path 时间戳，而不是每个恢复节点原始的 GPS time。`evo_traj bag ... /global_path` 适合快速查看全局校正轨迹形状；严格 APE 评估时，应确保导出的 `global_path.tum` 与 `reference.tum` 有可正确关联的时间戳。若 evo 提示关联数量过少，可使用带原始时间戳的自定义导出脚本，或修改异步重定位节点在发布每个 `PoseStamped` 时写入对应节点时间。
+注意：`degraded_reloc_node.cc` 发布 `/global_path` 话题时仍使用 `ros::Time::now()` 作为 Path 时间戳；新增的 `global_path.csv` 使用每个恢复节点原始 GPS time，`global_path_unix.csv` 使用对应 Unix time，更适合严格 APE 评估。
 
 常用 evo 参数：
 

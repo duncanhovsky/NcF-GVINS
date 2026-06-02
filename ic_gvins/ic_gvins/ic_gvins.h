@@ -69,6 +69,7 @@ public:
     bool addNewGnss(const GNSS &gnss);
     bool addNewHeading(const HeadingObservation &heading);
     bool addNewFrame(const Frame::Ptr &frame);
+    void setGpsUnixOffset(double gps_unix_offset);
 
     // NC-IC extension: expose optimized window snapshots to a ROS-side
     // asynchronous relocator without giving that node ownership of the IC
@@ -219,6 +220,8 @@ private:
     std::atomic<bool> isgnssobs_{false};
     std::atomic<bool> isheadingobs_{false};
     std::atomic<bool> isvisualobs_{false};
+    std::atomic<bool> has_gps_unix_offset_{false};
+    std::atomic<double> gps_unix_offset_{0.0};
 
     // IMU处理
     // Ins process
@@ -353,6 +356,7 @@ private:
     FileSaver::Ptr statfilesaver_;
     FileSaver::Ptr extfilesaver_;
     FileSaver::Ptr trajfilesaver_;
+    FileSaver::Ptr trajunixfilesaver_;
 
     // 系统状态
     // System state

@@ -10,6 +10,7 @@
 #include <ic_gvins/RecoveryEvent.h>
 #include <ic_gvins/RecoveryFrame.h>
 
+#include "ic_gvins/common/output_time.h"
 #include "reloc_segment_lifecycle.h"
 
 #include <ceres/ceres.h>
@@ -28,9 +29,12 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -87,6 +91,23 @@ struct SegmentResult {
     MapCorrection correction;
     std::map<std::uint64_t, geometry_msgs::PoseStamped> optimized_poses;
 };
+
+struct TrajectoryRow {
+    double gps_time{0};
+    Eigen::Vector3d position{0, 0, 0};
+    Eigen::Quaterniond orientation{1, 0, 0, 0};
+};
+
+std::string joinPath(const std::string &directory, const std::string &filename) {
+    if (directory.empty()) {
+        return filename;
+    }
+    const char last = directory.back();
+    if (last == '/' || last == '\\') {
+        return directory + filename;
+    }
+    return directory + "/" + filename;
+}
 
 struct RelativeFourDofFactor {
     RelativeFourDofFactor(const Eigen::Vector3d &delta_position, double delta_yaw,
@@ -257,6 +278,7 @@ private:
         bool should_notify = false;
         bool should_publish_path = false;
         nav_msgs::Path combined_path;
+        std::vector<TrajectoryRow> trajectory_rows;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto existing = all_nodes_.find(data.node_id);
@@ -271,12 +293,15 @@ private:
             lifecycle_.addNode(data);
             pending_ = lifecycle_.hasReady();
             should_notify = pending_;
-            combined_path = buildCombinedPathLocked(ros::Time::now());
+            const ros::Time stamp = ros::Time::now();
+            combined_path = buildCombinedPathLocked(stamp);
+            trajectory_rows = buildTrajectoryRowsLocked(stamp);
             should_publish_path = !combined_path.poses.empty();
         }
         if (should_publish_path) {
             global_path_publisher_.publish(combined_path);
             path_map_publisher_.publish(combined_path);
+            writeGlobalPathFiles(trajectory_rows);
         }
         if (should_notify) {
             condition_.notify_one();
@@ -435,6 +460,7 @@ private:
         nav_msgs::Path combined_path;
         visualization_msgs::MarkerArray segment_markers;
         geometry_msgs::TransformStamped transform;
+        std::vector<TrajectoryRow> trajectory_rows;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -459,6 +485,7 @@ private:
             current_correction_ = result.correction;
 
             combined_path = buildCombinedPathLocked(stamp);
+            trajectory_rows = buildTrajectoryRowsLocked(stamp);
             segment_markers = buildSegmentMarkersLocked(stamp);
             transform = makeMapToOdomTransformLocked(stamp);
         }
@@ -468,6 +495,7 @@ private:
         reloc_segments_publisher_.publish(segment_markers);
         map_to_odom_publisher_.publish(transform);
         transform_broadcaster_.sendTransform(transform);
+        writeGlobalPathFiles(trajectory_rows);
     }
 
     geometry_msgs::PoseStamped makeOptimizedPoseStamped(
@@ -551,6 +579,106 @@ private:
         return path;
     }
 
+    std::vector<TrajectoryRow> buildTrajectoryRowsLocked(const ros::Time &stamp) const {
+        std::vector<TrajectoryRow> rows;
+        rows.reserve(all_nodes_.size());
+
+        for (const auto &node_entry : all_nodes_) {
+            const RelocNodeData &node = node_entry.second;
+            geometry_msgs::PoseStamped pose;
+            bool used_optimized_pose = false;
+            for (const auto &result : segment_results_) {
+                const auto optimized = result.second.optimized_poses.find(node.node_id);
+                if (optimized != result.second.optimized_poses.end()) {
+                    pose = optimized->second;
+                    used_optimized_pose = true;
+                    break;
+                }
+            }
+            if (!used_optimized_pose) {
+                pose = transformNodePoseLocked(stamp, node, correctionForTimeLocked(node.time));
+            }
+
+            TrajectoryRow row;
+            row.gps_time = node.time;
+            row.position = Eigen::Vector3d(pose.pose.position.x, pose.pose.position.y,
+                                           pose.pose.position.z);
+            row.orientation = quaternionFromMessage(pose.pose.orientation);
+            rows.push_back(row);
+        }
+
+        std::sort(rows.begin(), rows.end(), [](const TrajectoryRow &lhs, const TrajectoryRow &rhs) {
+            return lhs.gps_time < rhs.gps_time;
+        });
+        return rows;
+    }
+
+    bool ensureOutputPathLocked() {
+        if (output_files_ready_) {
+            return true;
+        }
+
+        if (outputpath_.empty()) {
+            private_node_.getParam("outputpath", outputpath_);
+        }
+        if (outputpath_.empty()) {
+            ros::param::get("/ncf_gvins/outputpath", outputpath_);
+        }
+        if (outputpath_.empty()) {
+            ROS_WARN_THROTTLE(5.0, "NcF-GVINS reloc node waits for /ncf_gvins/outputpath before saving global_path");
+            return false;
+        }
+
+        global_path_file_ = joinPath(outputpath_, "global_path.csv");
+        global_path_unix_file_ = joinPath(outputpath_, "global_path_unix.csv");
+        output_files_ready_ = true;
+        return true;
+    }
+
+    bool updateGpsUnixOffsetLocked() {
+        double offset = 0.0;
+        if (ros::param::get("/ncf_gvins/gps_unix_offset", offset) && std::isfinite(offset)) {
+            gps_unix_offset_ = offset;
+            has_gps_unix_offset_ = true;
+        }
+        return has_gps_unix_offset_;
+    }
+
+    void writeTrajectoryFileLocked(const std::string &filename, const std::vector<TrajectoryRow> &rows,
+                                   bool use_unix_time) {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            ROS_WARN_THROTTLE(5.0, "Failed to open %s for global path output", filename.c_str());
+            return;
+        }
+
+        file << std::fixed << std::setprecision(9);
+        for (const auto &row : rows) {
+            const double stamp =
+                use_unix_time ? nc_output::unixTimeFromGpsWeekSecond(row.gps_time, gps_unix_offset_)
+                              : row.gps_time;
+            file << stamp << " " << row.position.x() << " " << row.position.y() << " "
+                 << row.position.z() << " " << row.orientation.x() << " " << row.orientation.y()
+                 << " " << row.orientation.z() << " " << row.orientation.w() << "\n";
+        }
+    }
+
+    void writeGlobalPathFiles(const std::vector<TrajectoryRow> &rows) {
+        if (rows.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(output_mutex_);
+        if (!ensureOutputPathLocked()) {
+            return;
+        }
+
+        writeTrajectoryFileLocked(global_path_file_, rows, false);
+        if (updateGpsUnixOffsetLocked()) {
+            writeTrajectoryFileLocked(global_path_unix_file_, rows, true);
+        }
+    }
+
     visualization_msgs::MarkerArray buildSegmentMarkersLocked(const ros::Time &stamp) const {
         visualization_msgs::MarkerArray markers;
         visualization_msgs::Marker clear;
@@ -629,6 +757,7 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::thread worker_;
+    std::mutex output_mutex_;
     bool finished_{false};
     bool pending_{false};
     nc_reloc::RelocSegmentLifecycle<RelocNodeData> lifecycle_;
@@ -645,6 +774,12 @@ private:
     double max_recovery_tail_duration_{10.0};
     int optimize_num_iterations_{20};
     double tf_publish_rate_{20.0};
+    std::string outputpath_;
+    std::string global_path_file_;
+    std::string global_path_unix_file_;
+    bool output_files_ready_{false};
+    bool has_gps_unix_offset_{false};
+    double gps_unix_offset_{0.0};
 };
 
 int main(int argc, char **argv) {

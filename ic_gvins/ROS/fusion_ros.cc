@@ -127,6 +127,22 @@ void FusionROS::setFinished() {
     }
 }
 
+void FusionROS::updateTimeReference(double unixsecond, double weeksec) {
+    const double offset = unixsecond - weeksec;
+    if (!std::isfinite(offset)) {
+        return;
+    }
+
+    if (!has_gps_unix_offset_ || std::abs(offset - gps_unix_offset_) > 1.0) {
+        gps_unix_offset_ = offset;
+        has_gps_unix_offset_ = true;
+        ros::param::set("/ncf_gvins/gps_unix_offset", gps_unix_offset_);
+    }
+    if (gvins_) {
+        gvins_->setGpsUnixOffset(gps_unix_offset_);
+    }
+}
+
 void FusionROS::run() {
     ros::NodeHandle nh;
     ros::NodeHandle pnh("~");
@@ -192,6 +208,7 @@ void FusionROS::run() {
 
     // Glog output path
     FLAGS_log_dir = outputpath;
+    ros::param::set("/ncf_gvins/outputpath", outputpath);
 
     // The GVINS object
     // NC-IC extension: distinguish the continuous online frame from the
@@ -260,6 +277,7 @@ void FusionROS::imuCallback(const sensor_msgs::ImuConstPtr &imumsg) {
     double weeksec;
     int week;
     GpsTime::unix2gps(unixsecond, week, weeksec);
+    updateTimeReference(unixsecond, weeksec);
 
     imu_.time = weeksec;
     // delta time
@@ -298,6 +316,7 @@ void FusionROS::gnssCallback(const sensor_msgs::NavSatFixConstPtr &gnssmsg) {
     double weeksec;
     int week;
     GpsTime::unix2gps(unixsecond, week, weeksec);
+    updateTimeReference(unixsecond, weeksec);
 
     gnss_ = GNSS();
     gnss_.time = weeksec;
@@ -483,7 +502,9 @@ void FusionROS::headingCallback(const geometry_msgs::PoseWithCovarianceStampedCo
     HeadingObservation heading;
     double weeksec;
     int week;
-    GpsTime::unix2gps(headingmsg->header.stamp.toSec(), week, weeksec);
+    double unixsecond = headingmsg->header.stamp.toSec();
+    GpsTime::unix2gps(unixsecond, week, weeksec);
+    updateTimeReference(unixsecond, weeksec);
     heading.time = weeksec;
     const auto &q = headingmsg->pose.pose.orientation;
     heading.yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -527,6 +548,7 @@ void FusionROS::imageCallback(const sensor_msgs::ImageConstPtr &imagemsg) {
     double weeksec;
     int week;
     GpsTime::unix2gps(unixsecond, week, weeksec);
+    updateTimeReference(unixsecond, weeksec);
 
     // Add new Image to GVINS
     frame_ = Frame::createFrame(weeksec, image);

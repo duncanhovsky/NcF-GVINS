@@ -141,14 +141,17 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
 
     // 文件IO
     // Output files
-    navfilesaver_    = FileSaver::create(outputpath + "/gvins.nav", 11);
-    ptsfilesaver_    = FileSaver::create(outputpath + "/mappoint.txt", 3);
-    statfilesaver_   = FileSaver::create(outputpath + "/statistics.txt", 3);
-    extfilesaver_    = FileSaver::create(outputpath + "/extrinsic.txt", 3);
-    imuerrfilesaver_ = FileSaver::create(outputpath + "/IMU_ERR.bin", 7, FileSaver::BINARY);
-    trajfilesaver_   = FileSaver::create(outputpath + "/trajectory.csv", 8);
+    navfilesaver_      = FileSaver::create(outputpath + "/gvins.nav", 11);
+    ptsfilesaver_      = FileSaver::create(outputpath + "/mappoint.txt", 3);
+    statfilesaver_     = FileSaver::create(outputpath + "/statistics.txt", 3);
+    extfilesaver_      = FileSaver::create(outputpath + "/extrinsic.txt", 3);
+    imuerrfilesaver_   = FileSaver::create(outputpath + "/IMU_ERR.bin", 7, FileSaver::BINARY);
+    trajfilesaver_     = FileSaver::create(outputpath + "/trajectory.csv", 8);
+    trajunixfilesaver_ = FileSaver::create(outputpath + "/trajectory_unix.csv", 8);
 
-    if (!navfilesaver_->isOpen() || !ptsfilesaver_->isOpen() || !statfilesaver_->isOpen() || !extfilesaver_->isOpen()) {
+    if (!navfilesaver_->isOpen() || !ptsfilesaver_->isOpen() || !statfilesaver_->isOpen() ||
+        !extfilesaver_->isOpen() || !imuerrfilesaver_->isOpen() || !trajfilesaver_->isOpen() ||
+        !trajunixfilesaver_->isOpen()) {
         LOGE << "Failed to open data file";
         return;
     }
@@ -407,6 +410,14 @@ void GVINS::setHealthStatusCallback(HealthStatusCallback callback) {
         health_status_callback_ = std::move(callback);
     }
     emitHealthStatus(0.0);
+}
+
+void GVINS::setGpsUnixOffset(double gps_unix_offset) {
+    if (!std::isfinite(gps_unix_offset)) {
+        return;
+    }
+    gps_unix_offset_.store(gps_unix_offset);
+    has_gps_unix_offset_.store(true);
 }
 
 bool GVINS::addNewImu(const IMU &input) {
@@ -1379,7 +1390,8 @@ void GVINS::runFusion() {
             // 总是输出最新的INS机械编排结果, 不占用INS锁
             // Always output the INS results
             if (gvinsstate_ > GVINS_INITIALIZING) {
-                MISC::writeNavResult(integration_config_, state, navfilesaver_, imuerrfilesaver_, trajfilesaver_);
+                MISC::writeNavResult(integration_config_, state, navfilesaver_, imuerrfilesaver_, trajfilesaver_,
+                                     trajunixfilesaver_, has_gps_unix_offset_.load(), gps_unix_offset_.load());
             }
 
         } // IMU BUFFER

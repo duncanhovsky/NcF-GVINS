@@ -25,6 +25,7 @@
 #include "common/angle.h"
 #include "common/earth.h"
 #include "common/logging.h"
+#include "common/output_time.h"
 #include "common/rotation.h"
 
 size_t MISC::getInsWindowIndex(const std::deque<std::pair<IMU, IntegrationState>> &window, double time) {
@@ -423,7 +424,8 @@ bool MISC::detectZeroVelocity(const vector<IMU> &imu_buffer, double imudatarate,
 
 void MISC::writeNavResult(const IntegrationConfiguration &config, const IntegrationState &state,
                           const FileSaver::Ptr &navfile, const FileSaver::Ptr &errfile,
-                          const FileSaver::Ptr &trajfile) {
+                          const FileSaver::Ptr &trajfile, const FileSaver::Ptr &trajunixfile,
+                          bool has_gps_unix_offset, double gps_unix_offset) {
     static int counts = 0;
     if (counts++ % 10) {
         return;
@@ -511,5 +513,9 @@ void MISC::writeNavResult(const IntegrationConfiguration &config, const Integrat
         result.push_back(state.q.w());
 
         trajfile->dump(result);
+        if (has_gps_unix_offset && trajunixfile && trajunixfile->isOpen()) {
+            result[0] = nc_output::unixTimeFromGpsWeekSecond(time, gps_unix_offset);
+            trajunixfile->dump(result);
+        }
     }
 }
