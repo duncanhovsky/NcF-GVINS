@@ -22,14 +22,15 @@
 
 #include "fileio/filesaver.h"
 
-#include <absl/strings/str_format.h>
+#include <iomanip>
 
 FileSaver::FileSaver(const string &filename, int columns, int filetype) {
     open(filename, columns, filetype);
 }
 
 bool FileSaver::open(const string &filename, int columns, int filetype) {
-    auto type = filetype == TEXT ? std::ios_base::out : (std::ios_base::out | std::ios_base::binary);
+    auto type = filetype == BINARY ? (std::ios_base::out | std::ios_base::binary)
+                                   : std::ios_base::out;
     filefp_.open(filename, type);
 
     columns_  = columns;
@@ -49,20 +50,27 @@ void FileSaver::dumpn(const vector<vector<double>> &data) {
 }
 
 void FileSaver::dump_(const vector<double> &data) {
-    if (filetype_ == TEXT) {
-        string line;
-
-        constexpr absl::string_view format = "%-15.9lf ";
-
-        line = absl::StrFormat(format, data[0]);
-        for (size_t k = 1; k < data.size(); k++) {
-            absl::StrAppendFormat(&line, format, data[k]);
-        }
-
-        filefp_ << line << "\n";
-    } else {
+    if (filetype_ == BINARY) {
         filefp_.write(reinterpret_cast<const char *>(data.data()), sizeof(double) * data.size());
+        return;
     }
+
+    filefp_ << std::fixed << std::setprecision(9);
+    if (filetype_ == TUM_TEXT) {
+        for (size_t k = 0; k < data.size(); k++) {
+            if (k > 0) {
+                filefp_ << " ";
+            }
+            filefp_ << data[k];
+        }
+        filefp_ << "\n";
+        return;
+    }
+
+    for (size_t k = 0; k < data.size(); k++) {
+        filefp_ << std::left << std::setw(15) << data[k] << " ";
+    }
+    filefp_ << "\n";
 }
 
 FileSaver::~FileSaver() {

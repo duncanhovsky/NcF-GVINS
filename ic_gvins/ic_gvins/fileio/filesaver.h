@@ -28,8 +28,6 @@
 #include <string>
 #include <vector>
 
-#include <absl/strings/string_view.h>
-
 #include "fileio/filebase.h"
 
 class FileSaver : public FileBase {

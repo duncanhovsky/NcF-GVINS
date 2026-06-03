@@ -33,8 +33,9 @@ class FileBase {
 
 public:
     enum FileType {
-        TEXT   = 0,
-        BINARY = 1,
+        TEXT     = 0,
+        BINARY   = 1,
+        TUM_TEXT = 2,
     };
 
     FileBase() = default;

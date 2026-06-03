@@ -146,8 +146,8 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     statfilesaver_     = FileSaver::create(outputpath + "/statistics.txt", 3);
     extfilesaver_      = FileSaver::create(outputpath + "/extrinsic.txt", 3);
     imuerrfilesaver_   = FileSaver::create(outputpath + "/IMU_ERR.bin", 7, FileSaver::BINARY);
-    trajfilesaver_     = FileSaver::create(outputpath + "/trajectory.csv", 8);
-    trajunixfilesaver_ = FileSaver::create(outputpath + "/trajectory_unix.csv", 8);
+    trajfilesaver_     = FileSaver::create(outputpath + "/trajectory.csv", 8, FileSaver::TUM_TEXT);
+    trajunixfilesaver_ = FileSaver::create(outputpath + "/trajectory_unix.csv", 8, FileSaver::TUM_TEXT);
 
     if (!navfilesaver_->isOpen() || !ptsfilesaver_->isOpen() || !statfilesaver_->isOpen() ||
         !extfilesaver_->isOpen() || !imuerrfilesaver_->isOpen() || !trajfilesaver_->isOpen() ||
