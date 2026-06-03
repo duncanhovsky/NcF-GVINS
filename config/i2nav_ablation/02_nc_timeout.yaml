@@ -1,0 +1,84 @@
+# i2Nav-Robot building00 ablation: isolate configured GNSS silence timeout.
+outputpath: "/home/dyishere/ncf_gvins_ws/output/i2nav_ablation/02_nc_timeout"
+is_make_outputdir: true
+
+sensor_profile:
+    dataset: "i2Nav-Robot building00"
+    camera_type: "mono pinhole, AVT left camera"
+    image_rate: 10
+    imu_rate: 200
+    gnss_rate: 1
+    magnetic_rate: 0
+
+initlength: 1
+imudatarate: 200
+iswithearth: true
+antlever: [0.0, -0.07, -0.365]
+
+imumodel:
+    arw: 0.1
+    vrw: 0.1
+    gbstd: 50.0
+    abstd: 50.0
+    corrtime: 1.0
+
+isusegnssoutage: false
+gnssoutagetime: 0
+gnssoutageendtime: 0
+gnssthreshold: 20
+
+nc_extension:
+    enabled: true
+    enable_async_relocator: false
+    gnss_recovery_confirm_samples: 1
+    horizontal_recovery_confirm_samples: 1
+    vertical_recovery_confirm_samples: 1
+    horizontal_recovery_confirm_duration: 0.0
+    vertical_recovery_confirm_duration: 0.0
+    gnss_timeout: 5.0
+    gnss_horizontal_innovation_threshold: 1000000000.0
+    gnss_vertical_innovation_threshold: 1000000000.0
+    recovery_min_horizontal_baseline: 10.0
+    recovery_max_yaw_deg: 20.0
+    startup_mode: "auto"
+    enable_local_bootstrap: false
+    local_static_duration: 1.0
+    global_alignment_min_baseline: 5.0
+    enable_earth_handover: false
+    enable_height_bias: false
+    height_bias_random_walk_std: 0.05
+    height_bias_prior_std: 20.0
+    use_magnetic_heading: false
+    heading_topic: "/mag_heading"
+    heading_max_sync_interval: 0.05
+    heading_innovation_threshold_deg: 20.0
+    heading_recovery_confirm_samples: 1
+    heading_degraded_covariance_scale: 1.0
+    visual_min_residuals: 0
+    visual_max_outlier_ratio: 1.0
+    vision_degrade_confirm_frames: 1
+    vision_recovery_confirm_frames: 1
+    vision_degraded_covariance_scale: 1.0
+    imu_recovery_confirm_intervals: 1
+    imu_degraded_covariance_scale: 1.0
+    imu_max_angular_rate: 0.0
+    imu_max_specific_force: 0.0
+
+is_use_visualization: true
+track_check_histogram: false
+track_min_parallax: 15
+track_max_interval: 0.5
+track_max_features: 500
+reprojection_error_std: 1.5
+optimize_windows_size: 10
+optimize_num_iterations: 20
+optimize_estimate_extrinsic: true
+optimize_estimate_td: true
+
+cam0:
+    intrinsic: [1064.8950, 1065.2546, 801.4049, 624.6878]
+    distortion: [-0.1516, 0.0942, 0.000169, -0.000142, -0.0229]
+    resolution: [1600, 1200]
+    q_b_c: [0.501597048, 0.497367045, 0.499880050, 0.501145048]
+    t_b_c: [0.1, -0.2, -0.054]
+    td_b_c: 0.0

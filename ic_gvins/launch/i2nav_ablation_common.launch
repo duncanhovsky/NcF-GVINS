@@ -1,0 +1,39 @@
+<launch>
+    <arg name="configfile"/>
+    <arg name="enable_nc_reloc" default="false"/>
+    <arg name="use_image_republish" default="true"/>
+    <arg name="enable_rviz" default="false"/>
+    <arg name="imu_topic" default="/adi/adis16465/imu"/>
+    <arg name="gnss_topic" default="/ublox/f9p/fix"/>
+    <arg name="image_topic" default="/avt_camera/left/image"/>
+
+    <node name="ic_gvins_node" pkg="ic_gvins" type="ic_gvins_ros" output="screen">
+        <param name="imu_topic" value="$(arg imu_topic)"/>
+        <param name="gnss_topic" value="$(arg gnss_topic)"/>
+        <param name="image_topic" value="$(arg image_topic)"/>
+        <param name="configfile" value="$(arg configfile)"/>
+    </node>
+
+    <node if="$(arg enable_nc_reloc)" name="nc_degraded_reloc_node" pkg="ic_gvins"
+          type="ic_gvins_reloc_node" output="screen">
+        <param name="relative_position_std" value="0.10"/>
+        <param name="relative_yaw_std_deg" value="1.0"/>
+        <param name="relative_reference_interval" value="0.5"/>
+        <param name="maximum_nodes" value="5000"/>
+        <param name="maximum_visualization_nodes" value="20000"/>
+        <param name="min_recovery_anchors" value="10"/>
+        <param name="max_recovery_tail_duration" value="10.0"/>
+        <param name="optimize_num_iterations" value="20"/>
+        <param name="tf_publish_rate" value="20.0"/>
+    </node>
+
+    <node if="$(arg use_image_republish)" pkg="image_transport" type="republish"
+          name="republish_left" output="screen"
+          args="compressed in:=$(arg image_topic) raw out:=$(arg image_topic)"/>
+
+    <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_map_broadcaster"
+          args="0 0 0 -1 0 0 0 map world"/>
+
+    <node if="$(arg enable_rviz)" name="visualisation" pkg="rviz" type="rviz" output="log"
+          args="-d $(find ic_gvins)/../config/visualization.rviz"/>
+</launch>
