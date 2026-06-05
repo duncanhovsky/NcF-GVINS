@@ -75,7 +75,8 @@ find_package(catkin REQUIRED COMPONENTS
 add_message_files(
         FILES
         RecoveryFrame.msg
-        RecoveryEvent.msg)
+        RecoveryEvent.msg
+        RecoveryConstraint.msg)
 generate_messages(
         DEPENDENCIES
         geometry_msgs

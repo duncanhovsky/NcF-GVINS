@@ -7,10 +7,12 @@
  * online recovery factors, GNSS anchors here always use unbiased raw_gnss.
  */
 
+#include <ic_gvins/RecoveryConstraint.h>
 #include <ic_gvins/RecoveryEvent.h>
 #include <ic_gvins/RecoveryFrame.h>
 
 #include "ic_gvins/common/output_time.h"
+#include "recovery_constraint_summary.h"
 #include "reloc_segment_lifecycle.h"
 
 #include <ceres/ceres.h>
@@ -214,6 +216,8 @@ public:
             node_.subscribe("recovery_frame", 200, &DegradedRelocNode::frameCallback, this);
         event_subscriber_ =
             node_.subscribe("recovery_event", 20, &DegradedRelocNode::eventCallback, this);
+        constraint_subscriber_ =
+            node_.subscribe("recovery_constraint", 200, &DegradedRelocNode::constraintCallback, this);
         global_path_publisher_ = node_.advertise<nav_msgs::Path>("global_path", 2);
         path_map_publisher_ = node_.advertise<nav_msgs::Path>("path_map", 2);
         map_to_odom_publisher_ =
@@ -340,6 +344,46 @@ private:
         }
     }
 
+    void constraintCallback(const ic_gvins::RecoveryConstraintConstPtr &message) {
+        if (message->segment_id < 0 || message->node_i == message->node_j) {
+            return;
+        }
+
+        nc_reloc::RecoveryConstraintSummary constraint;
+        constraint.segment_id = message->segment_id;
+        constraint.node_i = message->node_i;
+        constraint.node_j = message->node_j;
+        constraint.revision = message->revision;
+        constraint.time_i = message->time_i;
+        constraint.time_j = message->time_j;
+        constraint.source_type =
+            static_cast<nc_reloc::RecoveryConstraintSource>(message->source_type);
+        constraint.delta_position = {message->delta_position.x,
+                                     message->delta_position.y,
+                                     message->delta_position.z};
+        constraint.delta_yaw = message->delta_yaw;
+        for (size_t i = 0; i < 4; i++) {
+            constraint.std[i] = std::max(message->std[i], 1.0e-3);
+        }
+        constraint.quality_score = message->quality_score;
+        constraint.health_state = message->health_state;
+        constraint.switchable = message->switchable;
+
+        bool should_notify = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const bool changed =
+                nc_reloc::upsertConstraint(constraint_cache_[constraint.segment_id], constraint);
+            if (changed) {
+                pending_ = lifecycle_.hasReady();
+                should_notify = pending_;
+            }
+        }
+        if (should_notify) {
+            condition_.notify_one();
+        }
+    }
+
     void process() {
         while (ros::ok()) {
             std::vector<RelocNodeData> snapshot;
@@ -389,34 +433,73 @@ private:
             return false;
         }
 
+        std::vector<nc_reloc::RecoveryConstraintSummary> constraints;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = constraint_cache_.find(segment_id);
+            if (found != constraint_cache_.end()) {
+                constraints = found->second;
+            }
+        }
+
         std::vector<std::array<double, 3>> positions(nodes.size());
         std::vector<double> yaws(nodes.size());
+        std::map<std::uint64_t, size_t> node_index;
         ceres::Problem problem;
         for (size_t i = 0; i < nodes.size(); i++) {
             positions[i] = {nodes[i].odom_position.x(), nodes[i].odom_position.y(),
                             nodes[i].odom_position.z()};
             yaws[i] = nodes[i].odom_yaw;
+            node_index[nodes[i].node_id] = i;
             problem.AddParameterBlock(positions[i].data(), 3);
             problem.AddParameterBlock(&yaws[i], 1);
         }
 
         const double relative_yaw_std = relative_yaw_std_deg_ * M_PI / 180.0;
-        for (size_t i = 1; i < nodes.size(); i++) {
-            const Eigen::Matrix3d rotation =
-                Eigen::AngleAxisd(-nodes[i - 1].odom_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-            const Eigen::Vector3d relative_position =
-                rotation * (nodes[i].odom_position - nodes[i - 1].odom_position);
-            const double relative_yaw = normalizeAngle(nodes[i].odom_yaw - nodes[i - 1].odom_yaw);
-            const double interval_scale =
-                std::sqrt(std::max((nodes[i].time - nodes[i - 1].time) /
-                                       std::max(relative_reference_interval_, 1.0e-3),
-                                   1.0));
+        bool used_explicit_constraints = false;
+        for (const auto &constraint : constraints) {
+            const auto index_i = node_index.find(constraint.node_i);
+            const auto index_j = node_index.find(constraint.node_j);
+            if (index_i == node_index.end() || index_j == node_index.end()) {
+                continue;
+            }
+            const size_t i = index_i->second;
+            const size_t j = index_j->second;
+            const double position_std =
+                std::max((constraint.std[0] + constraint.std[1] + constraint.std[2]) / 3.0,
+                         1.0e-3);
+            const double yaw_std = std::max(constraint.std[3], 1.0e-3);
             auto *factor = new ceres::AutoDiffCostFunction<RelativeFourDofFactor, 4, 3, 1, 3, 1>(
-                new RelativeFourDofFactor(relative_position, relative_yaw,
-                                          relative_position_std_ * interval_scale,
-                                          relative_yaw_std * interval_scale));
-            problem.AddResidualBlock(factor, nullptr, positions[i - 1].data(), &yaws[i - 1],
-                                     positions[i].data(), &yaws[i]);
+                new RelativeFourDofFactor(
+                    Eigen::Vector3d(constraint.delta_position[0],
+                                    constraint.delta_position[1],
+                                    constraint.delta_position[2]),
+                    constraint.delta_yaw, position_std, yaw_std));
+            problem.AddResidualBlock(factor, new ceres::HuberLoss(1.0),
+                                     positions[i].data(), &yaws[i],
+                                     positions[j].data(), &yaws[j]);
+            used_explicit_constraints = true;
+        }
+
+        if (!used_explicit_constraints) {
+            for (size_t i = 1; i < nodes.size(); i++) {
+                const Eigen::Matrix3d rotation =
+                    Eigen::AngleAxisd(-nodes[i - 1].odom_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+                const Eigen::Vector3d relative_position =
+                    rotation * (nodes[i].odom_position - nodes[i - 1].odom_position);
+                const double relative_yaw = normalizeAngle(nodes[i].odom_yaw - nodes[i - 1].odom_yaw);
+                const double interval_scale =
+                    std::sqrt(std::max((nodes[i].time - nodes[i - 1].time) /
+                                           std::max(relative_reference_interval_, 1.0e-3),
+                                       1.0));
+                auto *factor =
+                    new ceres::AutoDiffCostFunction<RelativeFourDofFactor, 4, 3, 1, 3, 1>(
+                        new RelativeFourDofFactor(relative_position, relative_yaw,
+                                                  relative_position_std_ * interval_scale,
+                                                  relative_yaw_std * interval_scale));
+                problem.AddResidualBlock(factor, nullptr, positions[i - 1].data(), &yaws[i - 1],
+                                         positions[i].data(), &yaws[i]);
+            }
         }
 
         auto *gnss_loss = new ceres::HuberLoss(1.0);
@@ -747,6 +830,7 @@ private:
     ros::NodeHandle private_node_;
     ros::Subscriber frame_subscriber_;
     ros::Subscriber event_subscriber_;
+    ros::Subscriber constraint_subscriber_;
     ros::Publisher global_path_publisher_;
     ros::Publisher path_map_publisher_;
     ros::Publisher map_to_odom_publisher_;
@@ -762,6 +846,7 @@ private:
     bool pending_{false};
     nc_reloc::RelocSegmentLifecycle<RelocNodeData> lifecycle_;
     std::map<std::uint64_t, RelocNodeData> all_nodes_;
+    std::map<int, std::vector<nc_reloc::RecoveryConstraintSummary>> constraint_cache_;
     std::map<int, SegmentResult> segment_results_;
     MapCorrection current_correction_;
 

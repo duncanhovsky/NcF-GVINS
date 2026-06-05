@@ -27,6 +27,7 @@
 #include "ic_gvins/ic_gvins.h"
 
 #include <ic_gvins/RecoveryEvent.h>
+#include <ic_gvins/RecoveryConstraint.h>
 #include <ic_gvins/RecoveryFrame.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <ros/ros.h>
@@ -38,6 +39,7 @@
 #include <visualization_msgs/MarkerArray.h>
 
 #include <memory>
+#include <map>
 #include <queue>
 #include <string>
 
@@ -59,6 +61,7 @@ private:
 
     void publishRecoveryFrame(const RecoveryFrameData &frame);
     void publishRecoveryEvent(const RecoveryEventData &event);
+    void publishRecoveryConstraint(const RecoveryConstraintData &constraint);
     void publishGnssMeasurement(const GNSS &gnss);
     void publishSensorHealthStatus(const SensorHealthStatusData &status);
     void headingCallback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &headingmsg);
@@ -86,9 +89,13 @@ private:
     // correction node; no relocation work runs in the real-time ROS wrapper.
     ros::Publisher recovery_frame_pub_;
     ros::Publisher recovery_event_pub_;
+    ros::Publisher recovery_constraint_pub_;
     ros::Publisher gnss_measurement_pub_;
+    ros::Publisher gnss_measurement_status_pub_;
     ros::Publisher sensor_health_panel_pub_;
     sensor_msgs::PointCloud gnss_measurements_;
+    std::map<long long, int> gnss_status_marker_ids_;
+    int next_gnss_status_marker_id_{0};
     ros::WallTime last_sensor_health_panel_time_;
     bool has_sensor_health_panel_time_{false};
 

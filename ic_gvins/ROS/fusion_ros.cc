@@ -28,6 +28,7 @@
 #include "ic_gvins/common/logging.h"
 #include "ic_gvins/misc.h"
 #include "ic_gvins/tracking/frame.h"
+#include "ic_gvins/visualization/gnss_status_color.h"
 
 #include <yaml-cpp/yaml.h>
 
@@ -117,6 +118,10 @@ visualization_msgs::Marker makeHealthTextMarker(
     marker.text = text;
     marker.lifetime = ros::Duration(0.0);
     return marker;
+}
+
+long long gnssStatusKey(double time) {
+    return static_cast<long long>(std::llround(time * 1000.0));
 }
 
 } // namespace
@@ -233,12 +238,20 @@ void FusionROS::run() {
         // started shortly after the online node still receives current segment
         // activation; high-rate frame updates remain unlatched.
         recovery_event_pub_ = nh.advertise<ic_gvins::RecoveryEvent>("recovery_event", 20, true);
+        recovery_constraint_pub_ =
+            nh.advertise<ic_gvins::RecoveryConstraint>("recovery_constraint", 200);
         gvins_->setRecoveryFrameCallback(
             [this](const RecoveryFrameData &frame) { publishRecoveryFrame(frame); });
         gvins_->setRecoveryEventCallback(
             [this](const RecoveryEventData &event) { publishRecoveryEvent(event); });
+        gvins_->setRecoveryConstraintCallback(
+            [this](const RecoveryConstraintData &constraint) {
+                publishRecoveryConstraint(constraint);
+            });
     }
     gnss_measurement_pub_ = nh.advertise<sensor_msgs::PointCloud>("gnss_measurements", 2);
+    gnss_measurement_status_pub_ =
+        nh.advertise<visualization_msgs::MarkerArray>("gnss_measurement_status", 2);
     sensor_health_panel_pub_ =
         nh.advertise<visualization_msgs::MarkerArray>("sensor_health_panel", 2, true);
     gvins_->setGnssMeasurementCallback(
@@ -360,26 +373,70 @@ void FusionROS::publishGnssMeasurement(const GNSS &gnss) {
     if (!gnss.raw_local.allFinite()) {
         return;
     }
-    if (gnss_measurements_.channels.empty()) {
-        gnss_measurements_.header.frame_id = "map";
-        gnss_measurements_.channels.resize(3);
-        gnss_measurements_.channels[0].name = "horizontal_valid";
-        gnss_measurements_.channels[1].name = "vertical_valid";
-        gnss_measurements_.channels[2].name = "forced_degraded";
+    const bool has_health = gnss.health_state != SensorHealthState::UNAVAILABLE;
+    const ros::Time stamp = ros::Time::now();
+
+    if (!has_health) {
+        if (gnss_measurements_.channels.empty()) {
+            gnss_measurements_.header.frame_id = "map";
+            gnss_measurements_.channels.resize(3);
+            gnss_measurements_.channels[0].name = "horizontal_valid";
+            gnss_measurements_.channels[1].name = "vertical_valid";
+            gnss_measurements_.channels[2].name = "forced_degraded";
+        }
+
+        geometry_msgs::Point32 point;
+        point.x = static_cast<float>(gnss.raw_local.x());
+        point.y = static_cast<float>(gnss.raw_local.y());
+        point.z = static_cast<float>(gnss.raw_local.z());
+
+        gnss_measurements_.header.stamp = stamp;
+        gnss_measurements_.points.push_back(point);
+        gnss_measurements_.channels[0].values.push_back(gnss.horizontal_valid ? 1.0F : 0.0F);
+        gnss_measurements_.channels[1].values.push_back(gnss.vertical_valid ? 1.0F : 0.0F);
+        gnss_measurements_.channels[2].values.push_back(gnss.forced_degraded ? 1.0F : 0.0F);
+
+        gnss_measurement_pub_.publish(gnss_measurements_);
     }
 
-    geometry_msgs::Point32 point;
-    point.x = static_cast<float>(gnss.raw_local.x());
-    point.y = static_cast<float>(gnss.raw_local.y());
-    point.z = static_cast<float>(gnss.raw_local.z());
+    const long long status_key = gnssStatusKey(gnss.time);
+    auto marker_id = gnss_status_marker_ids_.find(status_key);
+    if (marker_id == gnss_status_marker_ids_.end()) {
+        marker_id =
+            gnss_status_marker_ids_.emplace(status_key, next_gnss_status_marker_id_++).first;
+    }
 
-    gnss_measurements_.header.stamp = ros::Time::now();
-    gnss_measurements_.points.push_back(point);
-    gnss_measurements_.channels[0].values.push_back(gnss.horizontal_valid ? 1.0F : 0.0F);
-    gnss_measurements_.channels[1].values.push_back(gnss.vertical_valid ? 1.0F : 0.0F);
-    gnss_measurements_.channels[2].values.push_back(gnss.forced_degraded ? 1.0F : 0.0F);
+    const bool recovery_anchor =
+        gnss.health_state == SensorHealthState::RECOVERING &&
+        gnss.horizontal_valid && !gnss.forced_degraded;
+    const auto color =
+        nc_visualization::gnssStatusColor(static_cast<int>(gnss.health_state),
+                                          gnss.horizontal_valid, gnss.vertical_valid,
+                                          gnss.forced_degraded, recovery_anchor);
 
-    gnss_measurement_pub_.publish(gnss_measurements_);
+    visualization_msgs::Marker marker;
+    marker.header.stamp = stamp;
+    marker.header.frame_id = "map";
+    marker.ns = "gnss_measurement_status";
+    marker.id = marker_id->second;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position.x = gnss.raw_local.x();
+    marker.pose.position.y = gnss.raw_local.y();
+    marker.pose.position.z = gnss.raw_local.z();
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.45;
+    marker.scale.y = 0.45;
+    marker.scale.z = 0.45;
+    marker.color.r = static_cast<float>(color.r);
+    marker.color.g = static_cast<float>(color.g);
+    marker.color.b = static_cast<float>(color.b);
+    marker.color.a = static_cast<float>(color.a);
+    marker.lifetime = ros::Duration(0.0);
+
+    visualization_msgs::MarkerArray markers;
+    markers.markers.push_back(marker);
+    gnss_measurement_status_pub_.publish(markers);
 }
 
 void FusionROS::publishSensorHealthStatus(const SensorHealthStatusData &status) {
@@ -496,6 +553,30 @@ void FusionROS::publishRecoveryEvent(const RecoveryEventData &event) {
     message.yaw_observable = event.deviation.yaw_observable;
     message.supporting_samples = event.deviation.supporting_samples;
     recovery_event_pub_.publish(message);
+}
+
+void FusionROS::publishRecoveryConstraint(const RecoveryConstraintData &constraint) {
+    ic_gvins::RecoveryConstraint message;
+    message.header.stamp = ros::Time::now();
+    message.header.frame_id = "odom";
+    message.segment_id = constraint.segment_id;
+    message.node_i = constraint.node_i;
+    message.node_j = constraint.node_j;
+    message.revision = constraint.revision;
+    message.time_i = constraint.time_i;
+    message.time_j = constraint.time_j;
+    message.source_type = static_cast<int>(constraint.source_type);
+    message.delta_position.x = constraint.delta_position.x();
+    message.delta_position.y = constraint.delta_position.y();
+    message.delta_position.z = constraint.delta_position.z();
+    message.delta_yaw = constraint.delta_yaw;
+    for (size_t i = 0; i < 4; i++) {
+        message.std[i] = constraint.std[i];
+    }
+    message.quality_score = constraint.quality_score;
+    message.health_state = static_cast<int>(constraint.health_state);
+    message.switchable = constraint.switchable;
+    recovery_constraint_pub_.publish(message);
 }
 
 void FusionROS::headingCallback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &headingmsg) {

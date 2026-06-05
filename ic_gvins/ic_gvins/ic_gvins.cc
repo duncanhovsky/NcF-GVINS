@@ -68,6 +68,24 @@ const char *sensorHealthStateName(SensorHealthState state) {
     return "unknown";
 }
 
+const char *motionTrendSourceName(nc_health::MotionTrendSource source) {
+    switch (source) {
+    case nc_health::MotionTrendSource::GNSS:
+        return "GNSS";
+    case nc_health::MotionTrendSource::IMU_PREINTEGRATION:
+        return "IMU_PREINTEGRATION";
+    case nc_health::MotionTrendSource::VISION_RELATIVE:
+        return "VISION_RELATIVE";
+    case nc_health::MotionTrendSource::HEADING:
+        return "HEADING";
+    case nc_health::MotionTrendSource::ONLINE_ODOM:
+        return "ONLINE_ODOM";
+    case nc_health::MotionTrendSource::WHEEL_ODOM:
+        return "WHEEL_ODOM";
+    }
+    return "UNKNOWN";
+}
+
 bool isRecoverableState(SensorHealthState state) {
     return state == SensorHealthState::DEGRADED || state == SensorHealthState::RECOVERING;
 }
@@ -81,6 +99,28 @@ std::string joinReasons(const std::vector<std::string> &reasons) {
         joined += "; " + reasons[i];
     }
     return joined;
+}
+
+double normalizeYaw(double yaw) {
+    while (yaw > M_PI) {
+        yaw -= 2.0 * M_PI;
+    }
+    while (yaw < -M_PI) {
+        yaw += 2.0 * M_PI;
+    }
+    return yaw;
+}
+
+double yawFromQuaternion(const Quaterniond &quaternion) {
+    const Matrix3d rotation = quaternion.normalized().toRotationMatrix();
+    return std::atan2(rotation(1, 0), rotation(0, 0));
+}
+
+std::uint64_t recoveryConstraintKey(std::uint64_t node_i, std::uint64_t node_j,
+                                    RecoveryConstraintSourceType source_type) {
+    const std::uint64_t source = static_cast<std::uint64_t>(source_type);
+    return node_i ^ (node_j + 0x9e3779b97f4a7c15ULL + (node_i << 6) + (node_i >> 2)) ^
+           (source << 56);
 }
 
 void logSensorHealthTransition(const std::string &sensor, SensorHealthState previous,
@@ -291,6 +331,34 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
             gnss_vertical_innovation_threshold_ =
                 nc_config["gnss_vertical_innovation_threshold"].as<double>();
         }
+        if (nc_config["enable_motion_trend_consensus"]) {
+            enable_motion_trend_consensus_ =
+                nc_config["enable_motion_trend_consensus"].as<bool>();
+        }
+        if (nc_config["trend_min_independent_sources"]) {
+            trend_consensus_options_.min_independent_sources =
+                nc_config["trend_min_independent_sources"].as<int>();
+        }
+        if (nc_config["trend_horizontal_threshold"]) {
+            trend_consensus_options_.horizontal_threshold =
+                nc_config["trend_horizontal_threshold"].as<double>();
+        }
+        if (nc_config["trend_min_horizontal_motion"]) {
+            trend_consensus_options_.min_horizontal_motion =
+                nc_config["trend_min_horizontal_motion"].as<double>();
+        }
+        if (nc_config["recovery_constraint_position_std"]) {
+            recovery_constraint_position_std_ =
+                nc_config["recovery_constraint_position_std"].as<double>();
+        }
+        if (nc_config["recovery_constraint_yaw_std_deg"]) {
+            recovery_constraint_yaw_std_ =
+                nc_config["recovery_constraint_yaw_std_deg"].as<double>() * D2R;
+        }
+        if (nc_config["recovery_constraint_reference_interval"]) {
+            recovery_constraint_reference_interval_ =
+                nc_config["recovery_constraint_reference_interval"].as<double>();
+        }
         if (nc_config["recovery_min_horizontal_baseline"]) {
             recovery_min_horizontal_baseline_ =
                 nc_config["recovery_min_horizontal_baseline"].as<double>();
@@ -397,6 +465,11 @@ void GVINS::setRecoveryFrameCallback(RecoveryFrameCallback callback) {
 void GVINS::setRecoveryEventCallback(RecoveryEventCallback callback) {
     std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
     recovery_event_callback_ = std::move(callback);
+}
+
+void GVINS::setRecoveryConstraintCallback(RecoveryConstraintCallback callback) {
+    std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+    recovery_constraint_callback_ = std::move(callback);
 }
 
 void GVINS::setGnssMeasurementCallback(GnssMeasurementCallback callback) {
@@ -599,6 +672,12 @@ bool GVINS::addNewGnss(const GNSS &gnss) {
                                   decision.vertical.state, reason,
                                   "valid GNSS available for original IC initialization",
                                   observation.time);
+        observation.health_state = decision.state;
+        observation.horizontal_health_state = decision.horizontal.state;
+        observation.vertical_health_state = decision.vertical.state;
+        observation.horizontal_valid = decision.horizontal.accepted;
+        observation.vertical_valid = decision.vertical.accepted;
+        emitGnssMeasurement(observation);
         emitHealthStatus(observation.time);
         LOGW << "NC-IC rejects degraded GNSS during the original IC initialization stage, condition="
              << reason;
@@ -774,6 +853,43 @@ Vector3d GVINS::adjustedOnlineGnssMeasurement(const GNSS &gnss) const {
     return rotation * gnss.raw_local + gnss.recovery_deviation.translation;
 }
 
+nc_health::TrendHealthEvidence GVINS::evaluateGnssHorizontalTrend(
+    double time, const Vector3d &predicted_antenna) const {
+    std::vector<nc_health::MotionTrendObservation> observations;
+    if (!enable_motion_trend_consensus_ || !has_gnss_trend_reference_ ||
+        !predicted_antenna.allFinite() || !gnss_.raw_local.allFinite()) {
+        return nc_health::TrendHealthEvidence();
+    }
+
+    const double duration = time - gnss_trend_reference_time_;
+    if (!std::isfinite(duration) || duration <= MINMUM_SYNC_INTERVAL) {
+        return nc_health::TrendHealthEvidence();
+    }
+
+    const Vector3d gnss_delta = gnss_.raw_local - gnss_trend_reference_raw_;
+    const Vector3d odom_delta = predicted_antenna - gnss_trend_reference_odom_;
+    observations.push_back(nc_health::MotionTrendObservation::horizontal(
+        nc_health::MotionTrendSource::GNSS, 1, gnss_trend_reference_time_, time,
+        gnss_delta.x(), gnss_delta.y(), std::max(gnss_.std.head<2>().norm(), 1.0)));
+    observations.push_back(nc_health::MotionTrendObservation::horizontal(
+        nc_health::MotionTrendSource::ONLINE_ODOM, 2, gnss_trend_reference_time_, time,
+        odom_delta.x(), odom_delta.y(), std::max(0.5, trend_consensus_options_.horizontal_threshold * 0.25)));
+
+    return nc_health::evaluateSourceHorizontalConsensus(
+        observations, nc_health::MotionTrendSource::GNSS, trend_consensus_options_);
+}
+
+void GVINS::updateGnssTrendReference(const GNSS &gnss, const Vector3d &predicted_antenna) {
+    if (!enable_motion_trend_consensus_ || !gnss.raw_local.allFinite() ||
+        !predicted_antenna.allFinite()) {
+        return;
+    }
+    gnss_trend_reference_time_ = gnss.time;
+    gnss_trend_reference_raw_ = gnss.raw_local;
+    gnss_trend_reference_odom_ = predicted_antenna;
+    has_gnss_trend_reference_ = true;
+}
+
 void GVINS::emitRecoveryEvent(RecoveryEventType type, double time) {
     RecoveryEventCallback callback;
     {
@@ -790,6 +906,17 @@ void GVINS::emitRecoveryEvent(RecoveryEventType type, double time) {
     event.event_type = type;
     event.deviation = recovery_deviation_;
     callback(event);
+}
+
+void GVINS::emitRecoveryConstraint(const RecoveryConstraintData &constraint) {
+    RecoveryConstraintCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
+        callback = recovery_constraint_callback_;
+    }
+    if (callback) {
+        callback(constraint);
+    }
 }
 
 void GVINS::emitGnssMeasurement(const GNSS &gnss) {
@@ -926,6 +1053,8 @@ bool GVINS::prepareGnssForOnlineFusion() {
     bool horizontal_valid = input_horizontal_valid;
     bool vertical_valid = input_vertical_valid;
     const bool has_prediction = !ins_window_.empty() && (gvinsstate_ >= GVINS_INITIALIZING_INS);
+    const Vector3d predicted_antenna =
+        has_prediction ? predictedAntennaPosition() : Vector3d::Zero();
     SensorHealthState previous_horizontal_health;
     SensorHealthState previous_vertical_health;
     {
@@ -951,7 +1080,7 @@ bool GVINS::prepareGnssForOnlineFusion() {
         gnss_.use_online_offset = recovery_deviation_.valid;
         gnss_.recovery_deviation = recovery_deviation_;
         const Vector3d online_measurement = adjustedOnlineGnssMeasurement(gnss_);
-        const Vector3d innovation = predictedAntennaPosition() - online_measurement;
+        const Vector3d innovation = predicted_antenna - online_measurement;
         horizontal_error = innovation.head<2>().norm();
         vertical_error = std::abs(innovation[2]);
         if (horizontal_error > gnss_horizontal_innovation_threshold_) {
@@ -970,6 +1099,27 @@ bool GVINS::prepareGnssForOnlineFusion() {
         }
     }
 
+    if (horizontal_valid && has_prediction && enable_motion_trend_consensus_) {
+        const auto trend_evidence = evaluateGnssHorizontalTrend(gnss_.time, predicted_antenna);
+        if (trend_evidence.has_evidence) {
+            horizontal_error = std::max(horizontal_error, trend_evidence.residual);
+            if (trend_evidence.is_outlier) {
+                horizontal_valid = false;
+                horizontal_reasons.emplace_back(
+                    absl::StrFormat("motion trend consensus marks GNSS outlier: residual %.3lf m, supporters=%d/%d",
+                                    trend_evidence.residual,
+                                    trend_evidence.supporting_sources,
+                                    trend_evidence.independent_sources));
+                LOGW << "NC-IC motion trend outlier: target="
+                     << motionTrendSourceName(trend_evidence.source_type)
+                     << ", residual=" << trend_evidence.residual
+                     << ", supporting_sources=" << trend_evidence.supporting_sources
+                     << ", independent_sources=" << trend_evidence.independent_sources
+                     << ", time=" << Logging::doubleData(gnss_.time);
+            }
+        }
+    }
+
     SensorHealthManager::Decision decision;
     {
         std::lock_guard<std::mutex> health_lock(health_mutex_);
@@ -981,6 +1131,7 @@ bool GVINS::prepareGnssForOnlineFusion() {
     gnss_.vertical_health_state = decision.vertical.state;
     gnss_.horizontal_valid = decision.horizontal.accepted;
     gnss_.vertical_valid = decision.vertical.accepted;
+    emitGnssMeasurement(gnss_);
     const std::string horizontal_degrade_reason = joinReasons(horizontal_reasons);
     const std::string vertical_degrade_reason = joinReasons(vertical_reasons);
     const std::string horizontal_recovery_reason =
@@ -1007,11 +1158,15 @@ bool GVINS::prepareGnssForOnlineFusion() {
         (previous_horizontal_health == SensorHealthState::DEGRADED ||
          previous_horizontal_health == SensorHealthState::RECOVERING);
     if (is_recovery_candidate) {
-        recovery_alignment_pairs_.emplace_back(gnss_.raw_local, predictedAntennaPosition());
+        recovery_alignment_pairs_.emplace_back(gnss_.raw_local, predicted_antenna);
         estimateRecoveryDeviation();
         LOGI << "NC-IC estimates recovery deviation segment " << recovery_segment_id_
              << ", translation " << recovery_deviation_.translation.transpose()
              << ", yaw " << recovery_deviation_.yaw * R2D << " deg";
+    }
+
+    if (has_prediction && input_horizontal_valid && horizontal_valid) {
+        updateGnssTrendReference(gnss_, predicted_antenna);
     }
 
     if (!decision.accept_online) {
@@ -1110,11 +1265,13 @@ void GVINS::emitRecoveryAnchor(const GNSS &gnss) {
 
 void GVINS::emitRecoveryFrames() {
     RecoveryFrameCallback callback;
+    RecoveryConstraintCallback constraint_callback;
     {
         std::lock_guard<std::mutex> lock(recovery_callback_mutex_);
         callback = recovery_frame_callback_;
+        constraint_callback = recovery_constraint_callback_;
     }
-    if (!callback) {
+    if (!callback && !constraint_callback) {
         return;
     }
 
@@ -1122,6 +1279,7 @@ void GVINS::emitRecoveryFrames() {
     // The first implementation copied every window state on every solve;
     // restricting packets to keyframes/GNSS anchors and assigning revisions
     // keeps asynchronous graph traffic bounded while allowing refinements.
+    std::vector<RecoveryFrameData> emitted_packets;
     for (const auto &statedata : statedatalist_) {
         RecoveryFrameData packet;
         packet.time = statedata.time;
@@ -1170,8 +1328,57 @@ void GVINS::emitRecoveryFrames() {
             }
         }
         if (packet.is_keyframe || packet.has_raw_gnss) {
-            callback(packet);
+            if (callback) {
+                callback(packet);
+            }
+            emitted_packets.push_back(packet);
         }
+    }
+
+    if (!constraint_callback || emitted_packets.size() < 2) {
+        return;
+    }
+    for (size_t i = 1; i < emitted_packets.size(); i++) {
+        const auto &previous = emitted_packets[i - 1];
+        const auto &current = emitted_packets[i];
+        if (previous.segment_id < 0 || previous.segment_id != current.segment_id ||
+            previous.node_id == current.node_id) {
+            continue;
+        }
+
+        const double yaw_i = yawFromQuaternion(previous.orientation);
+        const double yaw_j = yawFromQuaternion(current.orientation);
+        const Matrix3d rotation =
+            Eigen::AngleAxisd(-yaw_i, Vector3d::UnitZ()).toRotationMatrix();
+        const Vector3d relative_position =
+            rotation * (current.position - previous.position);
+        const double relative_yaw = normalizeYaw(yaw_j - yaw_i);
+        const double interval_scale =
+            std::sqrt(std::max((current.time - previous.time) /
+                                   std::max(recovery_constraint_reference_interval_, 1.0e-3),
+                               1.0));
+
+        RecoveryConstraintData constraint;
+        constraint.segment_id = previous.segment_id;
+        constraint.node_i = previous.node_id;
+        constraint.node_j = current.node_id;
+        constraint.time_i = previous.time;
+        constraint.time_j = current.time;
+        constraint.source_type = RecoveryConstraintSourceType::ONLINE_ODOM_RELATIVE;
+        constraint.delta_position = relative_position;
+        constraint.delta_yaw = relative_yaw;
+        constraint.std[0] = recovery_constraint_position_std_ * interval_scale;
+        constraint.std[1] = recovery_constraint_position_std_ * interval_scale;
+        constraint.std[2] = recovery_constraint_position_std_ * interval_scale;
+        constraint.std[3] = recovery_constraint_yaw_std_ * interval_scale;
+        constraint.quality_score = 1.0;
+        constraint.health_state = previous.health_state;
+        constraint.switchable = false;
+
+        const std::uint64_t key =
+            recoveryConstraintKey(constraint.node_i, constraint.node_j, constraint.source_type);
+        constraint.revision = ++recovery_constraint_revisions_[key];
+        constraint_callback(constraint);
     }
 }
 

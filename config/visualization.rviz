@@ -114,6 +114,14 @@ Visualization Manager:
           Value: true
         - Class: rviz/MarkerArray
           Enabled: true
+          Marker Topic: /gnss_measurement_status
+          Name: GNSS Measurement Status
+          Namespaces:
+            gnss_measurement_status: true
+          Queue Size: 10
+          Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
           Marker Topic: /sensor_health_panel
           Name: Sensor Health Panel
           Namespaces:

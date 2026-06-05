@@ -25,6 +25,7 @@
 
 #include "common/angle.h"
 #include "common/timecost.h"
+#include "health/motion_trend_consensus.h"
 #include "fileio/filesaver.h"
 #include "health/sensor_health_manager.h"
 #include "initialization/local_initializer.h"
@@ -76,10 +77,12 @@ public:
     // sliding window or changing the original real-time propagation thread.
     using RecoveryFrameCallback = std::function<void(const RecoveryFrameData &)>;
     using RecoveryEventCallback = std::function<void(const RecoveryEventData &)>;
+    using RecoveryConstraintCallback = std::function<void(const RecoveryConstraintData &)>;
     using GnssMeasurementCallback = std::function<void(const GNSS &)>;
     using HealthStatusCallback = std::function<void(const SensorHealthStatusData &)>;
     void setRecoveryFrameCallback(RecoveryFrameCallback callback);
     void setRecoveryEventCallback(RecoveryEventCallback callback);
+    void setRecoveryConstraintCallback(RecoveryConstraintCallback callback);
     void setGnssMeasurementCallback(GnssMeasurementCallback callback);
     void setHealthStatusCallback(HealthStatusCallback callback);
 
@@ -124,10 +127,14 @@ private:
     void checkGnssTimeout(double fusion_time);
     Vector3d predictedAntennaPosition() const;
     Vector3d adjustedOnlineGnssMeasurement(const GNSS &gnss) const;
+    nc_health::TrendHealthEvidence evaluateGnssHorizontalTrend(
+        double time, const Vector3d &predicted_antenna) const;
+    void updateGnssTrendReference(const GNSS &gnss, const Vector3d &predicted_antenna);
     void beginRecoverySegment(double time, const string &reason);
     bool estimateRecoveryDeviation();
     void emitRecoveryFrames();
     void emitRecoveryAnchor(const GNSS &gnss);
+    void emitRecoveryConstraint(const RecoveryConstraintData &constraint);
     void emitRecoveryEvent(RecoveryEventType type, double time);
     void emitGnssMeasurement(const GNSS &gnss);
     void emitHealthStatus(double time);
@@ -293,15 +300,26 @@ private:
     double visual_factor_std_scale_{1.0};
     double imu_max_angular_rate_{0.0};
     double imu_max_specific_force_{0.0};
+    bool enable_motion_trend_consensus_{true};
+    nc_health::TrendConsensusOptions trend_consensus_options_;
+    bool has_gnss_trend_reference_{false};
+    double gnss_trend_reference_time_{0.0};
+    Vector3d gnss_trend_reference_raw_{0, 0, 0};
+    Vector3d gnss_trend_reference_odom_{0, 0, 0};
+    double recovery_constraint_position_std_{0.15};
+    double recovery_constraint_yaw_std_{1.0 * D2R};
+    double recovery_constraint_reference_interval_{0.5};
 
     RecoveryFrameCallback recovery_frame_callback_;
     RecoveryEventCallback recovery_event_callback_;
+    RecoveryConstraintCallback recovery_constraint_callback_;
     GnssMeasurementCallback gnss_measurement_callback_;
     HealthStatusCallback health_status_callback_;
     std::mutex recovery_callback_mutex_;
     std::mutex gnss_measurement_callback_mutex_;
     std::mutex health_status_callback_mutex_;
     std::unordered_map<std::uint64_t, std::uint32_t> recovery_frame_revisions_;
+    std::unordered_map<std::uint64_t, std::uint32_t> recovery_constraint_revisions_;
 
     std::queue<Frame::Ptr> frame_buffer_;
 

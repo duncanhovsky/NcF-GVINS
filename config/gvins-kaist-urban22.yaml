@@ -54,6 +54,13 @@ nc_extension:
     gnss_timeout: 1.0
     gnss_horizontal_innovation_threshold: 15.0
     gnss_vertical_innovation_threshold: 30.0
+    enable_motion_trend_consensus: true
+    trend_min_independent_sources: 3
+    trend_horizontal_threshold: 3.0
+    trend_min_horizontal_motion: 0.2
+    recovery_constraint_position_std: 0.20
+    recovery_constraint_yaw_std_deg: 1.5
+    recovery_constraint_reference_interval: 0.5
     recovery_min_horizontal_baseline: 8.0
     recovery_max_yaw_deg: 20.0
     startup_mode: "auto"

@@ -139,6 +139,32 @@ typedef struct RecoveryFrameData {
     SensorHealthState vertical_health_state{SensorHealthState::UNAVAILABLE};
 } RecoveryFrameData;
 
+enum class RecoveryConstraintSourceType : int {
+    ONLINE_ODOM_RELATIVE = 0,
+    IMU_PREINTEGRATION_SUMMARY = 1,
+    VISION_RELATIVE_SUMMARY = 2,
+    HEADING_RELATIVE = 3,
+};
+
+// NC-IC extension: relative-motion edge summary passed to the asynchronous
+// relocation graph.  It is deliberately compact; raw visual landmarks and IMU
+// preintegration internals remain owned by the online estimator.
+typedef struct RecoveryConstraintData {
+    int segment_id{-1};
+    std::uint64_t node_i{0};
+    std::uint64_t node_j{0};
+    std::uint32_t revision{0};
+    double time_i{0};
+    double time_j{0};
+    RecoveryConstraintSourceType source_type{RecoveryConstraintSourceType::ONLINE_ODOM_RELATIVE};
+    Vector3d delta_position{0, 0, 0};
+    double delta_yaw{0};
+    double std[4]{1.0, 1.0, 1.0, 1.0};
+    double quality_score{1.0};
+    SensorHealthState health_state{SensorHealthState::UNAVAILABLE};
+    bool switchable{false};
+} RecoveryConstraintData;
+
 enum class RecoveryEventType : int {
     DEGRADED_START     = 0,
     RECOVERY_CONFIRMED = 1,
