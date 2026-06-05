@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ def load_module():
         raise AssertionError(f"missing evaluator script: {SCRIPT_PATH}")
     spec = importlib.util.spec_from_file_location("evaluate_i2nav_results", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -32,12 +34,13 @@ class EvaluateI2NavResultsTest(unittest.TestCase):
     def write_run(self, root, scheme, sequence, repeat_name="run_01", status="success", global_path=False):
         run_dir = root / scheme / sequence / repeat_name
         run_dir.mkdir(parents=True)
+        repeat_suffix = repeat_name[4:] if repeat_name.startswith("run_") else repeat_name
         (run_dir / "metadata.txt").write_text(
             "\n".join(
                 [
                     f"scheme={scheme}",
                     f"sequence={sequence}",
-                    f"repeat={repeat_name.removeprefix('run_')}",
+                    f"repeat={repeat_suffix}",
                     f"run_dir={run_dir}",
                 ]
             ),
