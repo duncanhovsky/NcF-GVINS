@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -149,6 +150,87 @@ class EvaluateI2NavResultsTest(unittest.TestCase):
         self.assertIn("Plotly.newPlot", html)
         self.assertIn("ape_trans_part.rmse", html)
         self.assertEqual(results_json[0]["scheme"], "08_nc_full")
+
+    def test_prepare_evo_tum_file_normalizes_spacing_and_trailing_delimiters(self):
+        raw_path = self.base / "legacy_trajectory.csv"
+        prepared_path = self.base / "cache" / "legacy_trajectory.tum"
+        raw_path.write_text(
+            "\n".join(
+                [
+                    "# timestamp tx ty tz qx qy qz qw",
+                    "timestamp tx ty tz qx qy qz qw",
+                    "0.0     0 0 0 0 0 0 1     ",
+                    "1.0,1,2,3,0,0,0,1,",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = self.module.prepare_evo_tum_file(raw_path, prepared_path)
+
+        self.assertEqual(report["valid_rows"], 2)
+        self.assertEqual(report["skipped_rows"], 2)
+        text = prepared_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            text,
+            "0.000000000 0.000000000 0.000000000 0.000000000 0.000000000 0.000000000 0.000000000 1.000000000\n"
+            "1.000000000 1.000000000 2.000000000 3.000000000 0.000000000 0.000000000 0.000000000 1.000000000\n",
+        )
+        for line in text.splitlines():
+            self.assertEqual(len(line.split(" ")), 8)
+            self.assertFalse(line.endswith(" "))
+
+    def test_evaluate_runs_passes_prepared_tum_files_to_evo(self):
+        results_root = self.base / "i2nav_ablation_batch"
+        batch_root = results_root / "20260605_120000"
+        truth_root = self.base / "truth"
+        truth_file = truth_root / "parking00" / "parking00_trajectory.csv"
+        truth_file.parent.mkdir(parents=True)
+        truth_file.write_text(
+            "0.0     0 0 0 0 0 0 1     \n1.0     1 0 0 0 0 0 1     \n",
+            encoding="utf-8",
+        )
+        run_dir = self.write_run(batch_root, "00_ic_baseline", "parking00")
+        (run_dir / "trajectory.csv").write_text(
+            "0.0     0 0 0 0 0 0 1     \n1.0,1,0,0,0,0,0,1,\n",
+            encoding="utf-8",
+        )
+        runs = self.module.discover_runs(results_root, truth_root, trajectory_names=("trajectory.csv",))
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return type(
+                "Completed",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": "rmse 0.100000\nmean 0.100000\nmedian 0.100000\nmin 0.100000\nmax 0.100000\nstd 0.000000\nsse 0.010000\n",
+                    "stderr": "",
+                },
+            )()
+
+        with mock.patch.object(self.module.subprocess, "run", side_effect=fake_run):
+            rows = self.module.evaluate_runs(
+                runs,
+                cache_dir=self.base / "cache",
+                force=True,
+                embed_trajectories=False,
+            )
+
+        self.assertEqual(rows[0]["evaluation_status"], "success")
+        self.assertEqual(len(commands), 2)
+        self.assertNotEqual(commands[0][2], str(truth_file))
+        self.assertNotEqual(commands[0][3], str(run_dir / "trajectory.csv"))
+        self.assertTrue(Path(commands[0][2]).exists())
+        self.assertTrue(Path(commands[0][3]).exists())
+        self.assertEqual(rows[0]["tum_format.estimate.valid_rows"], 2)
+        self.assertEqual(rows[0]["tum_format.reference.valid_rows"], 2)
+        for path in (Path(commands[0][2]), Path(commands[0][3])):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                self.assertEqual(len(line.split(" ")), 8)
+                self.assertFalse(line.endswith(" "))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ RUN_DIR_RE = re.compile(r"^run_(\d+)$")
 EVO_STAT_RE = re.compile(
     r"^\s*(max|mean|median|min|rmse|sse|std)\s*[:\t ]+\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
 )
+TUM_ENTRY_COUNT = 8
+TUM_DELIMITER_RE = re.compile(r"[\s,]+")
 
 
 @dataclass(frozen=True)
@@ -211,6 +213,74 @@ def load_tum_positions(path, max_points=300):
     return decimate_points(points, max_points)
 
 
+def split_tum_line(line):
+    return [part for part in TUM_DELIMITER_RE.split(line.strip()) if part]
+
+
+def format_tum_value(value):
+    return f"{value:.9f}"
+
+
+def prepare_evo_tum_file(input_path, output_path):
+    """Write an evo-compatible TUM file with 8 numeric columns and no trailing delimiter."""
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    report = {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "valid_rows": 0,
+        "skipped_rows": 0,
+        "bad_rows": 0,
+        "bad_row_examples": [],
+    }
+    normalized_lines = []
+
+    for line_number, raw_line in enumerate(input_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            report["skipped_rows"] += 1
+            continue
+
+        parts = split_tum_line(line)
+        if len(parts) != TUM_ENTRY_COUNT:
+            report["bad_rows"] += 1
+            if len(report["bad_row_examples"]) < 5:
+                report["bad_row_examples"].append(
+                    {"line": line_number, "entries": len(parts), "text": line[:160]}
+                )
+            continue
+
+        try:
+            values = [float(part) for part in parts]
+        except ValueError:
+            report["skipped_rows"] += 1
+            continue
+
+        if not all(math.isfinite(value) for value in values):
+            report["bad_rows"] += 1
+            if len(report["bad_row_examples"]) < 5:
+                report["bad_row_examples"].append(
+                    {"line": line_number, "entries": len(parts), "text": line[:160]}
+                )
+            continue
+
+        normalized_lines.append(" ".join(format_tum_value(value) for value in values))
+        report["valid_rows"] += 1
+
+    if not normalized_lines:
+        raise ValueError(f"no valid TUM rows in {input_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
+    return report
+
+
+def attach_tum_format_report(row, label, report):
+    prefix = f"tum_format.{label}"
+    for key, value in report.items():
+        row[f"{prefix}.{key}"] = value
+
+
 def base_result_row(record):
     row = {
         "run_id": record.run_id,
@@ -250,12 +320,12 @@ def base_result_row(record):
     return row
 
 
-def evo_command(evo_ape, record, metric, save_results_path=None):
+def evo_command(evo_ape, record, metric, save_results_path=None, reference_path=None, estimate_path=None):
     command = [
         evo_ape,
         "tum",
-        str(record.reference_path),
-        str(record.estimate_path),
+        str(reference_path if reference_path is not None else record.reference_path),
+        str(estimate_path if estimate_path is not None else record.estimate_path),
         "-r",
         metric,
         "-vas",
@@ -357,12 +427,33 @@ def evaluate_runs(
             rows.append(row)
             continue
 
+        prepared_reference_path = record_cache_dir / "reference.tum"
+        prepared_estimate_path = record_cache_dir / f"{record.trajectory_kind}.tum"
+        try:
+            reference_report = prepare_evo_tum_file(record.reference_path, prepared_reference_path)
+            estimate_report = prepare_evo_tum_file(record.estimate_path, prepared_estimate_path)
+        except ValueError as exc:
+            row["evaluation_status"] = "trajectory_format_invalid"
+            row["error_reason"] = str(exc)
+            rows.append(row)
+            continue
+
+        attach_tum_format_report(row, "reference", reference_report)
+        attach_tum_format_report(row, "estimate", estimate_report)
+
         row["evaluation_status"] = "success"
         for metric in DEFAULT_METRICS:
             prefix = metric_prefix(metric)
             save_results_path = record_cache_dir / f"ape_{metric}.zip"
             record_cache_dir.mkdir(parents=True, exist_ok=True)
-            command = evo_command(evo_ape, record, metric, save_results_path=save_results_path)
+            command = evo_command(
+                evo_ape,
+                record,
+                metric,
+                save_results_path=save_results_path,
+                reference_path=prepared_reference_path,
+                estimate_path=prepared_estimate_path,
+            )
             row[f"{prefix}.command"] = shlex.join(command)
 
             cached_stats = None if force else parse_cached_metric(record_cache_dir, metric)
