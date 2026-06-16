@@ -60,6 +60,7 @@ public:
 
     static bool getImuSeriesFromTo(const std::deque<std::pair<IMU, IntegrationState>> &ins_windows, double start,
                                    double end, vector<IMU> &series);
+    static bool getImuSeriesFromTo(const std::deque<IMU> &imu_history, double start, double end, vector<IMU> &series);
 
     static bool detectZeroVelocity(const vector<IMU> &imu_buffer, double imudatarate, vector<double> &average);
 

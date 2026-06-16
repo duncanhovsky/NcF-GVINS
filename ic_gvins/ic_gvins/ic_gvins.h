@@ -103,8 +103,10 @@ private:
     bool gvinsLocalInitialization();
     bool gvinsInitializationOptimization();
 
-    void addNewTimeNode(double time);
-    void addNewGnssTimeNode();
+    void appendImuHistory(const IMU &imu);
+    void pruneImuHistory(double newest_time);
+    bool addNewTimeNode(double time);
+    bool addNewGnssTimeNode();
     bool insertNewGnssTimeNode();
     void addNewKeyFrameTimeNode();
     bool removeUnusedTimeNode();
@@ -176,6 +178,8 @@ private:
     // 允许的最长预积分时间
     // Maximum length for IMU preintegration
     const double MAXIMUM_PREINTEGRATION_LENGTH = 10.0;
+    const double MAXIMUM_IMU_HISTORY_LENGTH = 30.0;
+    const double IMU_HISTORY_MARGIN = 1.0;
 
     // 先验标准差
     // The prior STD for IMU biases
@@ -324,6 +328,7 @@ private:
     std::queue<Frame::Ptr> frame_buffer_;
 
     std::queue<IMU> imu_buffer_;
+    std::deque<IMU> imu_history_;
     std::deque<std::pair<IMU, IntegrationState>> ins_window_;
 
     // IMU参数

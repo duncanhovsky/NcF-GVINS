@@ -439,6 +439,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     statedatalist_.clear();
     gnsslist_.clear();
     timelist_.clear();
+    imu_history_.clear();
 
     // GVINS fusion objects
     map_    = std::make_shared<Map>(optimize_windows_size_);
@@ -491,6 +492,29 @@ void GVINS::setGpsUnixOffset(double gps_unix_offset) {
     }
     gps_unix_offset_.store(gps_unix_offset);
     has_gps_unix_offset_.store(true);
+}
+
+void GVINS::appendImuHistory(const IMU &imu) {
+    imu_history_.push_back(imu);
+    pruneImuHistory(imu.time);
+}
+
+void GVINS::pruneImuHistory(double newest_time) {
+    if (imu_history_.size() < 3 || !std::isfinite(newest_time)) {
+        return;
+    }
+
+    double keep_after = newest_time - MAXIMUM_IMU_HISTORY_LENGTH;
+    if (!timelist_.empty()) {
+        keep_after = std::min(keep_after, timelist_.front() - IMU_HISTORY_MARGIN);
+    }
+    if (current_gnss_pending_) {
+        keep_after = std::min(keep_after, gnss_.time - IMU_HISTORY_MARGIN);
+    }
+
+    while (imu_history_.size() > 2 && imu_history_[1].time < keep_after) {
+        imu_history_.pop_front();
+    }
 }
 
 bool GVINS::addNewImu(const IMU &input) {
@@ -1430,6 +1454,7 @@ void GVINS::runFusion() {
             // INS mechanization
             { // INS
                 Lock lock3(ins_mutex_);
+                appendImuHistory(imu_cur);
                 if (!ins_window_.empty()) {
                     // 上一时刻的状态
                     // The INS state in last time for mechanization
@@ -1504,11 +1529,9 @@ void GVINS::runFusion() {
                         // 需要保证数据对齐, 否则等待
                         // For data align
                         if (gnss_.time < ins_window_.back().first.time) {
-                            if (prepareGnssForOnlineFusion()) {
+                            if (prepareGnssForOnlineFusion() && addNewGnssTimeNode()) {
                                 // 加入新的GNSS节点
                                 // Add a new GNSS time node
-                                addNewGnssTimeNode();
-
                                 consumeCurrentGnss();
                                 isgnssobs_   = true;
                                 optimization_sem_.notify_one();
@@ -2035,13 +2058,16 @@ void GVINS::addNewKeyFrameTimeNode() {
 
         keyframes_.pop();
 
-        // 添加关键帧
+        if (!addNewTimeNode(frametime)) {
+            LOGW << "Skip keyframe " << frame->keyFrameId() << " at " << Logging::doubleData(frametime)
+                 << " because the required IMU interval is unavailable";
+            continue;
+        }
+
         // Add new keyframe time node
         LOGI << "Insert keyframe " << frame->keyFrameId() << " at " << Logging::doubleData(frame->stamp()) << " with "
              << frame->unupdatedMappoints().size() << " new mappoints";
         map_->insertKeyFrame(frame);
-
-        addNewTimeNode(frametime);
         LOGI << "Add new keyframe time node at " << Logging::doubleData(frametime);
     }
 
@@ -2175,6 +2201,28 @@ bool GVINS::insertNewGnssTimeNode() {
             timelist.push_back(timelist_[k]);
         }
 
+        double segment_start = sta;
+        vector<IMU> series;
+        if (!MISC::getImuSeriesFromTo(imu_history_, segment_start, gnss_.time, series)) {
+            LOGW << "Unused GNSS due to unavailable IMU interval " << Logging::doubleData(segment_start) << " to "
+                 << Logging::doubleData(gnss_.time);
+            return true;
+        }
+        segment_start = gnss_.time;
+        for (double node_time : timelist) {
+            if (!MISC::getImuSeriesFromTo(imu_history_, segment_start, node_time, series)) {
+                LOGW << "Unused GNSS due to unavailable IMU interval " << Logging::doubleData(segment_start) << " to "
+                     << Logging::doubleData(node_time);
+                return true;
+            }
+            segment_start = node_time;
+        }
+
+        const auto timelist_backup = timelist_;
+        const auto statedatalist_backup = statedatalist_;
+        const auto preintegrationlist_backup = preintegrationlist_;
+        const auto gnsslist_backup = gnsslist_;
+
         // Remove back time node
         size_t num_remove = timelist_.size() - index;
         for (size_t k = num_remove; k > 0; k--) {
@@ -2184,34 +2232,62 @@ bool GVINS::insertNewGnssTimeNode() {
         }
 
         // Add GNSS time node
-        addNewGnssTimeNode();
+        if (!addNewGnssTimeNode()) {
+            timelist_ = timelist_backup;
+            statedatalist_ = statedatalist_backup;
+            preintegrationlist_ = preintegrationlist_backup;
+            gnsslist_ = gnsslist_backup;
+            LOGW << "Unused GNSS because inserting time node failed at " << Logging::doubleData(gnss_.time);
+            return true;
+        }
 
         // Add back time node
         for (size_t k = 0; k < timelist.size(); k++) {
-            addNewTimeNode(timelist[k]);
+            if (!addNewTimeNode(timelist[k])) {
+                timelist_ = timelist_backup;
+                statedatalist_ = statedatalist_backup;
+                preintegrationlist_ = preintegrationlist_backup;
+                gnsslist_ = gnsslist_backup;
+                LOGW << "Unused GNSS because rebuilding time node failed at " << Logging::doubleData(timelist[k]);
+                return true;
+            }
         }
     }
 
     return true;
 }
 
-void GVINS::addNewGnssTimeNode() {
+bool GVINS::addNewGnssTimeNode() {
     LOGI << "Add new GNSS time node " << Logging::doubleData(gnss_.time);
 
-    addNewTimeNode(gnss_.time);
+    if (!addNewTimeNode(gnss_.time)) {
+        LOGW << "Failed to add GNSS time node " << Logging::doubleData(gnss_.time);
+        return false;
+    }
     gnsslist_.push_back(gnss_);
+    return true;
 }
 
-void GVINS::addNewTimeNode(double time) {
+bool GVINS::addNewTimeNode(double time) {
 
     vector<IMU> series;
     IntegrationState state;
+
+    if (timelist_.empty() || statedatalist_.empty()) {
+        LOGW << "Failed to add time node " << Logging::doubleData(time)
+             << " because the sliding window has not been initialized";
+        return false;
+    }
 
     // 获取时段内用于预积分的IMU数据
     // Obtain the IMU samples between the two time nodes
     double start = timelist_.back();
     double end   = time;
-    MISC::getImuSeriesFromTo(ins_window_, start, end, series);
+    if (!MISC::getImuSeriesFromTo(imu_history_, start, end, series) || series.empty()) {
+        LOGW << "Failed to add time node " << Logging::doubleData(time)
+             << " because the required IMU interval is unavailable";
+        return false;
+    }
 
     state = Preintegration::stateFromData(statedatalist_.back(), preintegration_options_);
 
@@ -2233,6 +2309,7 @@ void GVINS::addNewTimeNode(double time) {
 
     statedatalist_.emplace_back(Preintegration::stateToData(state, preintegration_options_));
     timelist_.push_back(time);
+    return true;
 }
 
 void GVINS::parametersStatistic() {

@@ -28,6 +28,8 @@
 #include "common/output_time.h"
 #include "common/rotation.h"
 
+#include <cmath>
+
 size_t MISC::getInsWindowIndex(const std::deque<std::pair<IMU, IntegrationState>> &window, double time) {
     // 返回时间大于输入的第一个索引
 
@@ -64,6 +66,43 @@ size_t MISC::getInsWindowIndex(const std::deque<std::pair<IMU, IntegrationState>
 
     return index;
 }
+
+namespace {
+
+size_t getImuHistoryIndex(const std::deque<IMU> &history, double time) {
+    if (history.empty() || (history.front().time > time) || (history.back().time <= time)) {
+        return 0;
+    }
+
+    size_t index = 0;
+    size_t sta = 0, end = history.size();
+
+    int counts = 0;
+    while (true) {
+        auto mid = (sta + end) / 2;
+
+        auto first  = history[mid - 1].time;
+        auto second = history[mid].time;
+
+        if ((first <= time) && (time < second)) {
+            index = mid;
+            break;
+        } else if (first > time) {
+            end = mid;
+        } else if (second <= time) {
+            sta = mid;
+        }
+
+        if (counts++ > 15) {
+            LOGE << "Failed to get IMU history index at " << Logging::doubleData(time);
+            break;
+        }
+    }
+
+    return index;
+}
+
+} // namespace
 
 bool MISC::getCameraPoseFromInsWindow(const std::deque<std::pair<IMU, IntegrationState>> &window, const Pose &pose_b_c,
                                       double time, Pose &pose) {
@@ -314,17 +353,25 @@ void MISC::imuInterpolation(const IMU &imu01, IMU &imu00, IMU &imu11, double mid
 
 bool MISC::getImuSeriesFromTo(const std::deque<std::pair<IMU, IntegrationState>> &ins_windows, double start, double end,
                               vector<IMU> &series) {
+    series.clear();
+    if (ins_windows.size() < 2 || !std::isfinite(start) || !std::isfinite(end) || start >= end) {
+        LOGE << "Failed to get IMU series for invalid interval " << Logging::doubleData(start) << " to "
+             << Logging::doubleData(end);
+        return false;
+    }
+
     // 获得起点和终点附近的索引
     size_t is = getInsWindowIndex(ins_windows, start);
     size_t ie = getInsWindowIndex(ins_windows, end);
 
-    if ((is == 0) && (ie == 0)) {
-        LOGE << "Failed to get right IMU series " << Logging::doubleData(start) << " to " << Logging::doubleData(end);
+    if ((is == 0) || (ie == 0)) {
+        LOGE << "Failed to get right IMU series " << Logging::doubleData(start) << " to " << Logging::doubleData(end)
+             << ", available window " << Logging::doubleData(ins_windows.front().first.time) << " to "
+             << Logging::doubleData(ins_windows.back().first.time);
         return false;
     }
 
     IMU imu0, imu1, imu;
-    series.clear();
 
     // 内插起点
     imu0 = ins_windows[is - 1].first;
@@ -362,7 +409,76 @@ bool MISC::getImuSeriesFromTo(const std::deque<std::pair<IMU, IntegrationState>>
         imuInterpolation(imu1, imu, imu1, end);
         series.push_back(imu);
     }
+    if (series.empty()) {
+        LOGE << "Failed to build non-empty IMU series " << Logging::doubleData(start) << " to "
+             << Logging::doubleData(end);
+        return false;
+    }
     // 显式替换时间
+    series.back().time = end;
+
+    return true;
+}
+
+bool MISC::getImuSeriesFromTo(const std::deque<IMU> &imu_history, double start, double end, vector<IMU> &series) {
+    series.clear();
+    if (imu_history.size() < 2 || !std::isfinite(start) || !std::isfinite(end) || start >= end) {
+        LOGE << "Failed to get IMU history series for invalid interval " << Logging::doubleData(start) << " to "
+             << Logging::doubleData(end);
+        return false;
+    }
+
+    size_t is = getImuHistoryIndex(imu_history, start);
+    size_t ie = getImuHistoryIndex(imu_history, end);
+
+    if ((is == 0) || (ie == 0)) {
+        LOGE << "Failed to get right IMU history series " << Logging::doubleData(start) << " to "
+             << Logging::doubleData(end) << ", available history "
+             << Logging::doubleData(imu_history.front().time) << " to "
+             << Logging::doubleData(imu_history.back().time);
+        return false;
+    }
+
+    IMU imu0, imu1, imu;
+
+    imu0 = imu_history[is - 1];
+    imu1 = imu_history[is];
+
+    int isneed = isNeedInterpolation(imu0, imu1, start);
+    if (isneed == -1) {
+        series.push_back(imu0);
+        series.push_back(imu1);
+    } else if (isneed == 1) {
+        series.push_back(imu1);
+    } else if (isneed == 2) {
+        imuInterpolation(imu1, imu, imu1, start);
+        series.push_back(imu);
+        series.push_back(imu1);
+    }
+
+    for (size_t k = is + 1; k < ie - 1; k++) {
+        series.push_back(imu_history[k]);
+    }
+
+    imu0 = imu_history[ie - 1];
+    imu1 = imu_history[ie];
+
+    isneed = isNeedInterpolation(imu0, imu1, end);
+    if (isneed == -1) {
+        series.push_back(imu0);
+    } else if (isneed == 1) {
+        series.push_back(imu0);
+        series.push_back(imu1);
+    } else if (isneed == 2) {
+        series.push_back(imu0);
+        imuInterpolation(imu1, imu, imu1, end);
+        series.push_back(imu);
+    }
+    if (series.empty()) {
+        LOGE << "Failed to build non-empty IMU history series " << Logging::doubleData(start) << " to "
+             << Logging::doubleData(end);
+        return false;
+    }
     series.back().time = end;
 
     return true;
