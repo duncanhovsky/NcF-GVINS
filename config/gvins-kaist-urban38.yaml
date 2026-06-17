@@ -23,7 +23,7 @@ initlength: 1
 imudatarate: 100
 iswithearth: true
 
-antlever: [0.0, 0.0, 0.0]
+antlever: [-0.25, 0.0, 0.0]
 
 imumodel:
     arw: 0.3
@@ -96,11 +96,11 @@ optimize_estimate_extrinsic: false
 optimize_estimate_td: true
 
 cam0:
-    intrinsic: [816.9037899277, 811.5680382849, 608.5072628169, 263.4759976444]
-    distortion: [-0.0561430278, 0.1395256320, -0.0012155907, -0.0009728139]
+    intrinsic: [816.4022147406, 817.3838856281, 608.8265842758, 266.6886565244, -2.3882017758]
+    distortion: [-0.0500404858, 0.1200121717, -0.0006259806, -0.0011825064, -0.063505208]
     resolution: [1280, 560]
 
-    # body_T_cam0 from kaist_urban38_config.yaml converted to q_b_c/t_b_c.
-    q_b_c: [-0.502042960, 0.505585657, -0.497783109, 0.494517933]
-    t_b_c: [1.71239, 0.247401, -0.11589]
+    # Vehicle FLU calibration converted to the GVINS body frame (front-right-down).
+    q_b_c: [0.4945228450, 0.4977781973, 0.5055857733, 0.5020428746]
+    t_b_c: [1.71239, -0.247401, 0.11589]
     td_b_c: 0.0

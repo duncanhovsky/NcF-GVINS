@@ -97,6 +97,14 @@ target_link_libraries(${PROJECT_NAME}_ros
         ${catkin_LIBRARIES}
         ic_gvins_core)
 
+# KAIST raw IMU uses a front-left-up convention; this adapter republishes it
+# as front-right-down before it reaches the common fusion node.
+add_executable(kaist_imu_frd_converter
+        ROS/kaist_imu_frd_converter.cc)
+add_dependencies(kaist_imu_frd_converter ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(kaist_imu_frd_converter
+        ${catkin_LIBRARIES})
+
 # NC-IC extension: a loop-node-like asynchronous map correction process.
 # It is separated from ic_gvins_ros so map correction never blocks online odom.
 add_executable(${PROJECT_NAME}_reloc_node

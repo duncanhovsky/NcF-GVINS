@@ -1,11 +1,24 @@
 <launch>
     <arg name="configfile" default="$(find ic_gvins)/../config/gvins-kaist-urban38.yaml"/>
     <arg name="enable_nc_reloc" default="true"/>
+    <arg name="use_kaist_imu_converter" default="true"/>
+    <arg name="raw_imu_topic" default="/imu/data_raw"/>
+    <arg name="imu_topic" default="/imu/data_frd"/>
+    <arg name="gnss_topic" default="/gps/fix"/>
+    <arg name="image_topic" default="/stereo/left/image_color"/>
+
+    <node if="$(arg use_kaist_imu_converter)" name="kaist_imu_frd_converter"
+          pkg="ic_gvins" type="kaist_imu_frd_converter" output="screen">
+        <param name="input_topic" value="$(arg raw_imu_topic)"/>
+        <param name="output_topic" value="$(arg imu_topic)"/>
+        <param name="output_frame_id" value="imu_frd"/>
+        <param name="invalidate_orientation" value="true"/>
+    </node>
 
     <node name="ic_gvins_node" pkg="ic_gvins" type="ic_gvins_ros" output="screen">
-        <param name="imu_topic" value="/imu/data_raw"/>
-        <param name="gnss_topic" value="/gps/fix"/>
-        <param name="image_topic" value="/stereo/left/image_raw"/>
+        <param name="imu_topic" value="$(arg imu_topic)"/>
+        <param name="gnss_topic" value="$(arg gnss_topic)"/>
+        <param name="image_topic" value="$(arg image_topic)"/>
         <param name="configfile" value="$(arg configfile)"/>
     </node>
 
