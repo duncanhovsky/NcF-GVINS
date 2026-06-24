@@ -25,6 +25,7 @@
 
 #include "common/angle.h"
 #include "common/timecost.h"
+#include "diagnostics/console_diagnostics.h"
 #include "health/motion_trend_consensus.h"
 #include "fileio/filesaver.h"
 #include "health/sensor_health_manager.h"
@@ -115,10 +116,13 @@ private:
     void addStateParameters(ceres::Problem &problem);
     void addReprojectionParameters(ceres::Problem &problem);
 
-    void addImuFactors(ceres::Problem &problem);
+    vector<ceres::ResidualBlockId> addImuFactors(ceres::Problem &problem);
     vector<std::pair<ceres::ResidualBlockId, GNSS *>> addGnssFactors(ceres::Problem &problem, bool isusekernel);
-    void addHeadingFactors(ceres::Problem &problem, bool isusekernel);
-    vector<ceres::ResidualBlockId> addReprojectionFactors(ceres::Problem &problem, bool isusekernel);
+    vector<std::pair<ceres::ResidualBlockId, HeadingObservation *>> addHeadingFactors(ceres::Problem &problem,
+                                                                                      bool isusekernel);
+    vector<ceres::ResidualBlockId>
+        addReprojectionFactors(ceres::Problem &problem, bool isusekernel,
+                               std::vector<nc_diag::VisualResidualDecision> *visual_decisions = nullptr);
     void doReintegration();
 
     void updateParametersFromOptimizer();
@@ -149,9 +153,11 @@ private:
     bool gvinsRemoveAllSecondNewFrame();
 
     void gnssOutlierCullingByChi2(ceres::Problem &problem,
-                                  vector<std::pair<ceres::ResidualBlockId, GNSS *>> &redisual_block);
+                                  vector<std::pair<ceres::ResidualBlockId, GNSS *>> &redisual_block,
+                                  std::vector<nc_diag::GnssFactorDecision> *decisions = nullptr);
     static int removeReprojectionFactorsByChi2(ceres::Problem &problem, vector<ceres::ResidualBlockId> &residual_ids,
-                                               double chi2);
+                                               double chi2,
+                                               std::vector<nc_diag::VisualResidualDecision> *visual_decisions = nullptr);
 
     // Processing thread
     void runFusion();
@@ -271,6 +277,7 @@ private:
     // in the same global-local frame.  These fields keep online odom smooth
     // after an outage while raw_local remains unbiased for the map relocator.
     bool nc_extension_enabled_{false};
+    bool realtime_mode_{false};
     double gnss_horizontal_innovation_threshold_{20.0};
     double gnss_vertical_innovation_threshold_{30.0};
     double recovery_min_horizontal_baseline_{5.0};
@@ -306,6 +313,8 @@ private:
     double imu_max_specific_force_{0.0};
     bool enable_motion_trend_consensus_{true};
     nc_health::TrendConsensusOptions trend_consensus_options_;
+    nc_diag::ConsoleDiagnosticsOptions console_diagnostics_options_;
+    int console_diagnostics_sequence_{0};
     bool has_gnss_trend_reference_{false};
     double gnss_trend_reference_time_{0.0};
     Vector3d gnss_trend_reference_raw_{0, 0, 0};

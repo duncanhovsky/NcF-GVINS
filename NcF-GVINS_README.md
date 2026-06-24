@@ -472,6 +472,17 @@ python scripts/show_extrinsic.py
 | `ic_gvins/launch/*.launch` | 通用、KAIST、i2Nav 启动文件。 |
 | `config/*.yaml` | 数据集和系统参数配置。 |
 
+## Offline bag timing mode
+
+`nc_extension.realtime_mode` defaults to `false` in the provided configs.
+This mode is intended for offline rosbag evaluation: if GNSS observations are
+already buffered for the current fusion time, GNSS timeout is suppressed until
+the buffered observations are consumed. This avoids treating estimator backlog
+as a real GNSS outage.
+
+Set `realtime_mode: true` for online real-time operation when the estimator
+should keep progressing without waiting for lower-rate observations.
+
 ## 11. License
 
 本仓库继承 IC-GVINS 的 GPLv3 许可。原始 IC-GVINS 作者与引用信息见 [README.md](README.md)。

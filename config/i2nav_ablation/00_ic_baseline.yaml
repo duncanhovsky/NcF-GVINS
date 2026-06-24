@@ -30,6 +30,7 @@ gnssthreshold: 20
 
 nc_extension:
     enabled: false
+    realtime_mode: false
     enable_async_relocator: false
     gnss_recovery_confirm_samples: 1
     horizontal_recovery_confirm_samples: 1

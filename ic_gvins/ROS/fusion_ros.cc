@@ -46,6 +46,7 @@
 #include <sstream>
 
 std::atomic<bool> isfinished{false};
+std::atomic<int> exit_signal{0};
 
 void sigintHandler(int sig);
 void checkStateThread(std::shared_ptr<FusionROS> fusion);
@@ -168,7 +169,7 @@ void FusionROS::run() {
     try {
         config = YAML::LoadFile(configfile);
     } catch (YAML::Exception &exception) {
-        std::cout << "Failed to open configuration file" << std::endl;
+        LOGE << "Failed to open configuration file: " << configfile;
         return;
     }
     auto outputpath        = config["outputpath"].as<string>();
@@ -179,7 +180,7 @@ void FusionROS::run() {
         boost::filesystem::create_directory(outputpath);
     }
     if (!boost::filesystem::is_directory(outputpath)) {
-        std::cout << "Failed to open outputpath" << std::endl;
+        LOGE << "Failed to open outputpath: " << outputpath;
         return;
     }
 
@@ -273,10 +274,6 @@ void FusionROS::run() {
         heading_sub = nh.subscribe<geometry_msgs::PoseWithCovarianceStamped>(
             heading_topic_, 20, &FusionROS::headingCallback, this);
     }
-
-    LOGI << "Waiting ROS message; NC=" << nc_extension_enabled_
-         << ", async relocation=" << enable_async_relocator_
-         << ", calibrated magnetic heading=" << use_magnetic_heading_;
 
     // enter message loopback
     ros::spin();
@@ -644,32 +641,29 @@ void FusionROS::imageCallback(const sensor_msgs::ImageConstPtr &imagemsg) {
         }
     }
 
-    LOG_EVERY_N(INFO, 20) << "Raw data time " << Logging::doubleData(imu_.time) << ", "
-                          << Logging::doubleData(gnss_.time) << ", " << Logging::doubleData(frame_->stamp());
 }
 
 void sigintHandler(int sig) {
-    std::cout << "Terminate by Ctrl+C " << sig << std::endl;
+    exit_signal = sig;
     isfinished = true;
 }
 
 void checkStateThread(std::shared_ptr<FusionROS> fusion) {
-    std::cout << "Check thread is started..." << std::endl;
-
     auto fusion_ptr = std::move(fusion);
     while (!isfinished) {
         sleep(1);
+    }
+    const int signal = exit_signal.load();
+    if (signal != 0) {
+        LOGW << "Terminate by Ctrl+C " << signal;
     }
 
     // Exit the GVINS thread
     fusion_ptr->setFinished();
 
-    std::cout << "GVINS has been shutdown ..." << std::endl;
-
     // Shutdown ROS
     ros::shutdown();
-
-    std::cout << "ROS node has been shutdown ..." << std::endl;
+    LOGW << "GVINS and ROS node have been shutdown";
 }
 
 int main(int argc, char *argv[]) {
@@ -686,8 +680,6 @@ int main(int argc, char *argv[]) {
 
     // Check thread
     std::thread check_thread(checkStateThread, fusion);
-
-    std::cout << "Fusion process is started..." << std::endl;
 
     // Enter message loop
     fusion->run();

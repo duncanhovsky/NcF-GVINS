@@ -177,7 +177,7 @@ TrackState Tracking::track(Frame::Ptr frame) {
             return TRACK_INITIALIZING;
         }
 
-        LOGI << "Initialization tracking with parallax " << parallax_ref_;
+        DLOGI << "Initialization tracking with parallax " << parallax_ref_;
 
         triangulation();
 
@@ -276,12 +276,12 @@ keyFrameState Tracking::checkKeyFrameSate() {
 
         keyframe_state = map_->isWindowFull() ? KEYFRAME_REMOVE_OLDEST : KEYFRAME_NORMAL;
 
-        LOGI << "Keyframe at " << Logging::doubleData(frame_cur_->stamp()) << ", mappoints "
+        DLOGI << "Keyframe at " << Logging::doubleData(frame_cur_->stamp()) << ", mappoints "
              << frame_cur_->numFeatures() << ", interval " << dt << ", parallax " << parallax;
     } else if (dt > track_max_interval_) {
         // 普通观测帧, 非关键帧
         keyframe_state = KEYFRAME_REMOVE_SECOND_NEW;
-        LOGI << "Keyframe at " << Logging::doubleData(frame_cur_->stamp()) << " due to long interval";
+        DLOGI << "Keyframe at " << Logging::doubleData(frame_cur_->stamp()) << " due to long interval";
     }
 
     // 切换上一关键帧, 用于时间间隔计算
@@ -449,7 +449,7 @@ bool Tracking::trackMappoint() {
 
     parallax_map_counts_ = parallaxFromReferenceMapPoints(parallax_map_);
 
-    LOGI << "Track " << tracked_mappoint_.size() << " map points";
+    DLOGI << "Track " << tracked_mappoint_.size() << " map points";
 
     return true;
 }
@@ -568,7 +568,7 @@ bool Tracking::trackReferenceFrame() {
     // 用于下一帧的跟踪
     pts2d_new_ = pts2d_cur_;
 
-    LOGI << "Track " << pts2d_new_.size() << " reference points";
+    DLOGI << "Track " << pts2d_new_.size() << " reference points";
 
     return !pts2d_new_.empty();
 }
@@ -684,7 +684,7 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
         }
     }
 
-    LOGI << "Add " << num_new_features << " new features to " << num_features;
+    DLOGI << "Add " << num_new_features << " new features to " << num_features;
 }
 
 bool Tracking::triangulation() {
@@ -792,7 +792,7 @@ bool Tracking::triangulation() {
 
     pts2d_new_ = pts2d_cur_;
 
-    LOGI << "Triangulate " << num_succeeded << " 3D points with " << pts2d_cur_.size() << " left, " << num_reset
+    DLOGI << "Triangulate " << num_succeeded << " 3D points with " << pts2d_cur_.size() << " left, " << num_reset
          << " reset, " << num_outtime << " outtime and " << num_outlier << " outliers";
     return true;
 }

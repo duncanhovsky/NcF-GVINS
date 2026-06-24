@@ -27,6 +27,7 @@
 #include "common/earth.h"
 #include "common/gpstime.h"
 #include "common/logging.h"
+#include "health/gnss_timeout_policy.h"
 
 #include "factors/gnss_factor.h"
 #include "factors/heading_factor.h"
@@ -50,6 +51,7 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -116,6 +118,22 @@ double yawFromQuaternion(const Quaterniond &quaternion) {
     return std::atan2(rotation(1, 0), rotation(0, 0));
 }
 
+double yawDegFromPoseData(const double pose[7]) {
+    const double yaw = std::atan2(2.0 * (pose[6] * pose[5] + pose[3] * pose[4]),
+                                  1.0 - 2.0 * (pose[4] * pose[4] + pose[5] * pose[5]));
+    return normalizeYaw(yaw) * R2D;
+}
+
+nc_diag::PoseBrief makePoseBrief(const IntegrationStateData &state) {
+    nc_diag::PoseBrief pose;
+    pose.time = state.time;
+    pose.p[0] = state.pose[0];
+    pose.p[1] = state.pose[1];
+    pose.p[2] = state.pose[2];
+    pose.yaw_deg = yawDegFromPoseData(state.pose);
+    return pose;
+}
+
 std::uint64_t recoveryConstraintKey(std::uint64_t node_i, std::uint64_t node_j,
                                     RecoveryConstraintSourceType source_type) {
     const std::uint64_t source = static_cast<std::uint64_t>(source_type);
@@ -175,7 +193,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     try {
         config = YAML::LoadFile(configfile);
     } catch (YAML::Exception &exception) {
-        std::cout << "Failed to open configuration file" << std::endl;
+        LOGE << "Failed to open configuration file: " << configfile;
         return;
     }
 
@@ -267,9 +285,26 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     if (config["nc_extension"]) {
         const auto nc_config = config["nc_extension"];
         nc_extension_enabled_ = nc_config["enabled"] ? nc_config["enabled"].as<bool>() : false;
+        if (nc_config["console_diagnostics"]) {
+            const auto diag_config = nc_config["console_diagnostics"];
+            if (diag_config["enabled"]) {
+                console_diagnostics_options_.enabled = diag_config["enabled"].as<bool>();
+            }
+            if (diag_config["window_detail_stride"]) {
+                console_diagnostics_options_.window_detail_stride =
+                    std::max(1, diag_config["window_detail_stride"].as<int>());
+            }
+            if (diag_config["max_window_slots"]) {
+                console_diagnostics_options_.max_window_slots =
+                    std::max(0, diag_config["max_window_slots"].as<int>());
+            }
+        }
 
         SensorHealthManager::Options health_options;
         health_options.enabled = nc_extension_enabled_;
+        if (nc_config["realtime_mode"]) {
+            realtime_mode_ = nc_config["realtime_mode"].as<bool>();
+        }
         if (nc_config["gnss_recovery_confirm_samples"]) {
             health_options.horizontal_recovery_confirm_samples =
                 nc_config["gnss_recovery_confirm_samples"].as<int>();
@@ -421,10 +456,6 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
             LOGW << "NC-IC cannot directly hand over a live local window to Earth mode; "
                     "global alignment remains represented by map_to_odom";
         }
-        LOGI << "NC-IC GNSS health/recovery extension is " << (nc_extension_enabled_ ? "enabled" : "disabled");
-        LOGI << "NC-IC local bootstrap is " << (enable_local_bootstrap_ ? "enabled" : "disabled")
-             << ", height bias is " << (enable_height_bias_ ? "enabled" : "disabled")
-             << ", magnetic heading is " << (use_magnetic_heading_ ? "enabled" : "disabled");
     }
 
     // 归一化相机坐标系下
@@ -659,7 +690,7 @@ bool GVINS::addNewGnss(const GNSS &gnss) {
         // NC-IC extension: after local odom is running, later GNSS establishes
         // map coordinates only.  Changing gravity mid-session would make old
         // and new normal preintegrations inconsistent.
-        LOGI << "Local gravity is initialized as " << Logging::doubleData(integration_parameters_->gravity);
+        LOGI << "[INIT] local gravity " << Logging::doubleData(integration_parameters_->gravity);
 
         if (nc_extension_enabled_ && local_bootstrap_active_) {
             // NC-IC extension: online states already live in arbitrary local
@@ -756,8 +787,18 @@ void GVINS::consumeCurrentGnss() {
 }
 
 void GVINS::checkGnssTimeout(double fusion_time) {
-    if (!nc_extension_enabled_ || gnss_timeout_ <= 0.0 || last_processed_gnss_time_ <= 0.0 ||
-        gnss_timeout_active_ || (fusion_time - last_processed_gnss_time_) <= gnss_timeout_) {
+    if (!nc_extension_enabled_ || gnss_timeout_active_) {
+        return;
+    }
+    bool has_pending_gnss_before_fusion_time = current_gnss_pending_;
+    if (!has_pending_gnss_before_fusion_time) {
+        std::lock_guard<std::mutex> lock(gnss_buffer_mutex_);
+        has_pending_gnss_before_fusion_time =
+            !gnss_buffer_.empty() && gnss_buffer_.front().time < fusion_time;
+    }
+    if (!nc_health::shouldTriggerGnssTimeout(
+            realtime_mode_, fusion_time, last_processed_gnss_time_,
+            gnss_timeout_, has_pending_gnss_before_fusion_time)) {
         return;
     }
     bool is_active = false;
@@ -848,7 +889,7 @@ bool GVINS::addNewHeading(const HeadingObservation &heading) {
         optimization_sem_.notify_one();
         // NC-IC extension: calibrated heading is attached to an existing IC
         // state rather than creating a parallel high-rate state chain.
-        LOGI << "NC-IC adds calibrated heading at " << Logging::doubleData(accepted.time);
+        DLOGI << "NC-IC adds calibrated heading at " << Logging::doubleData(accepted.time);
     }
     state_mutex_.unlock();
     return true;
@@ -1125,6 +1166,18 @@ bool GVINS::prepareGnssForOnlineFusion() {
 
     if (horizontal_valid && has_prediction && enable_motion_trend_consensus_) {
         const auto trend_evidence = evaluateGnssHorizontalTrend(gnss_.time, predicted_antenna);
+        if (console_diagnostics_options_.enabled) {
+            nc_diag::MotionTrendLine trend_line;
+            trend_line.time = gnss_.time;
+            trend_line.source = motionTrendSourceName(nc_health::MotionTrendSource::GNSS);
+            trend_line.has_evidence = trend_evidence.has_evidence;
+            trend_line.is_outlier = trend_evidence.is_outlier;
+            trend_line.supporting_sources = trend_evidence.supporting_sources;
+            trend_line.independent_sources = trend_evidence.independent_sources;
+            trend_line.residual = trend_evidence.residual;
+            trend_line.threshold = trend_consensus_options_.horizontal_threshold;
+            LOGI << nc_diag::formatMotionTrend(trend_line);
+        }
         if (trend_evidence.has_evidence) {
             horizontal_error = std::max(horizontal_error, trend_evidence.residual);
             if (trend_evidence.is_outlier) {
@@ -1164,6 +1217,31 @@ bool GVINS::prepareGnssForOnlineFusion() {
     const std::string vertical_recovery_reason =
         absl::StrFormat("valid vertical GNSS accepted by recovery gate, samples=%d, innovation=%.3lf m",
                         decision.vertical.recovery_samples, vertical_error);
+    if (console_diagnostics_options_.enabled) {
+        nc_diag::HealthDecisionLine horizontal_line;
+        horizontal_line.time = gnss_.time;
+        horizontal_line.sensor = "GNSS-H";
+        horizontal_line.previous_state = sensorHealthStateName(previous_horizontal_health);
+        horizontal_line.current_state = sensorHealthStateName(decision.horizontal.state);
+        horizontal_line.accepted = decision.horizontal.accepted;
+        horizontal_line.innovation = horizontal_error;
+        horizontal_line.threshold = gnss_horizontal_innovation_threshold_;
+        horizontal_line.recovery_samples = decision.horizontal.recovery_samples;
+        horizontal_line.reason = decision.horizontal.accepted ? horizontal_recovery_reason : horizontal_degrade_reason;
+        LOGI << nc_diag::formatHealthDecision(horizontal_line);
+
+        nc_diag::HealthDecisionLine vertical_line;
+        vertical_line.time = gnss_.time;
+        vertical_line.sensor = "GNSS-V";
+        vertical_line.previous_state = sensorHealthStateName(previous_vertical_health);
+        vertical_line.current_state = sensorHealthStateName(decision.vertical.state);
+        vertical_line.accepted = decision.vertical.accepted;
+        vertical_line.innovation = vertical_error;
+        vertical_line.threshold = gnss_vertical_innovation_threshold_;
+        vertical_line.recovery_samples = decision.vertical.recovery_samples;
+        vertical_line.reason = decision.vertical.accepted ? vertical_recovery_reason : vertical_degrade_reason;
+        LOGI << nc_diag::formatHealthDecision(vertical_line);
+    }
     logSensorHealthTransition("GNSS horizontal", previous_horizontal_health,
                               decision.horizontal.state, horizontal_degrade_reason,
                               horizontal_recovery_reason, gnss_.time);
@@ -1184,9 +1262,13 @@ bool GVINS::prepareGnssForOnlineFusion() {
     if (is_recovery_candidate) {
         recovery_alignment_pairs_.emplace_back(gnss_.raw_local, predicted_antenna);
         estimateRecoveryDeviation();
-        LOGI << "NC-IC estimates recovery deviation segment " << recovery_segment_id_
-             << ", translation " << recovery_deviation_.translation.transpose()
-             << ", yaw " << recovery_deviation_.yaw * R2D << " deg";
+        if (console_diagnostics_options_.enabled) {
+            LOGI << "  [RECOVERY] segment=" << recovery_segment_id_
+                 << " samples=" << recovery_deviation_.supporting_samples
+                 << " yaw=" << recovery_deviation_.yaw * R2D
+                 << " observable=" << (recovery_deviation_.yaw_observable ? "Y" : "N")
+                 << " trans=" << recovery_deviation_.translation.transpose();
+        }
     }
 
     if (has_prediction && input_horizontal_valid && horizontal_valid) {
@@ -1430,7 +1512,6 @@ void GVINS::runFusion() {
     IntegrationState state;
     Frame::Ptr frame;
 
-    LOGI << "Fusion thread is started";
     while (!isfinished_) { // While
         Lock lock(fusion_mutex_);
         fusion_sem_.wait(lock);
@@ -1630,16 +1711,13 @@ void GVINS::runFusion() {
 
 void GVINS::runOptimization() {
 
-    TimeCost timecost, timecost2;
+    TimeCost timecost2;
 
-    LOGI << "Optimization thread is started";
     while (!isfinished_) {
         Lock lock(optimization_mutex_);
         optimization_sem_.wait(lock);
 
         if (isgnssobs_ || isvisualobs_ || isheadingobs_) {
-            timecost.restart();
-
             // 加锁, 保护状态量
             // Lock the state
             state_mutex_.lock();
@@ -1654,9 +1732,9 @@ void GVINS::runOptimization() {
                     // Enter the initialization of the visual system
                     gvinsstate_ = GVINS_INITIALIZING_VIO;
                     if (isinitialized) {
-                        LOGI << "GINS initialization is finished";
+                        LOGI << "[INIT] GINS initialization finished";
                     } else {
-                        LOGW << "GINS initialization is not convergence";
+                        LOGW << "[INIT] GINS initialization is not convergence";
                     }
                 }
             } else if (gvinsstate_ >= GVINS_TRACKING_INITIALIZING) {
@@ -1711,9 +1789,6 @@ void GVINS::runOptimization() {
             // Release the state lock
             state_mutex_.unlock();
             isoptimized_ = true;
-
-            LOGI << "Optimization costs " << timecost.costInMillisecond() << " ms with " << timecosts_[0] << " and "
-                 << timecosts_[1] << " with marginalization costs " << timecosts_[2];
         }
     }
 }
@@ -1725,7 +1800,6 @@ void GVINS::runTracking() {
 
     std::deque<std::pair<IMU, IntegrationState>> ins_windows;
 
-    LOGI << "Tracking thread is started";
     while (!isfinished_) {
         Lock lock(tracking_mutex_);
         tracking_sem_.wait(lock);
@@ -1791,7 +1865,7 @@ void GVINS::runTracking() {
 
                 isframeready_ = true;
 
-                LOGI << "Tracking cost " << timecost.costInMillisecond() << " ms";
+                DLOGI << "Tracking cost " << timecost.costInMillisecond() << " ms";
             }
         }
     }
@@ -1866,7 +1940,7 @@ bool GVINS::gvinsInitialization() {
         initatt[0] = -asin(fb[1] / integration_parameters_->gravity);
         initatt[1] = asin(fb[0] / integration_parameters_->gravity);
 
-        LOGI << "Zero velocity get gyroscope bias " << bg.transpose() * 3600 * R2D << ", roll " << initatt[0] * R2D
+        LOGI << "[INIT] zero velocity gyro_bias_dph=" << bg.transpose() * 3600 * R2D << " roll=" << initatt[0] * R2D
              << ", pitch " << initatt[1] * R2D;
         is_has_zero_velocity = true;
     }
@@ -1876,7 +1950,7 @@ bool GVINS::gvinsInitialization() {
     if (!is_zero_velocity) {
         if (last_gnss_.isyawvalid) {
             initatt[2] = last_gnss_.yaw;
-            LOGI << "Initialized heading from dual-antenna GNSS as " << initatt[2] * R2D << " deg";
+            LOGI << "[INIT] heading from dual-antenna GNSS " << initatt[2] * R2D << " deg";
         } else {
             const double gnss_dt = gnss_.time - last_gnss_.time;
             if (gnss_dt <= 0.0) {
@@ -1894,17 +1968,17 @@ bool GVINS::gvinsInitialization() {
             if (!is_has_zero_velocity) {
                 initatt[0] = 0;
                 initatt[1] = atan(-vel.z() / sqrt(vel.x() * vel.x() + vel.y() * vel.y()));
-                LOGI << "Initialized pitch from GNSS as " << initatt[1] * R2D << " deg";
+                LOGI << "[INIT] pitch from GNSS " << initatt[1] * R2D << " deg";
             }
             initatt[2] = atan2(vel.y(), vel.x());
-            LOGI << "Initialized heading from GNSS as " << initatt[2] * R2D << " deg";
+            LOGI << "[INIT] heading from GNSS " << initatt[2] * R2D << " deg";
         }
     } else if (use_magnetic_heading_ && latest_heading_.valid) {
         // NC-IC extension: original IC waits for GNSS motion to initialize
         // heading.  A configured calibrated heading can complete a static
         // initialization, while default-off datasets retain original logic.
         initatt[2] = latest_heading_.yaw;
-        LOGI << "Initialized heading from calibrated external heading as "
+        LOGI << "[INIT] heading from calibrated external heading "
              << initatt[2] * R2D << " deg";
     } else {
         return false;
@@ -1943,7 +2017,7 @@ bool GVINS::gvinsInitialization() {
     state = Preintegration::stateFromData(statedatalist_.back(), preintegration_options_);
     MISC::redoInsMechanization(integration_config_, state, reserved_ins_num_, ins_window_);
 
-    LOGI << "Initialization at " << Logging::doubleData(gnss_.time);
+    LOGI << "[INIT] completed at " << Logging::doubleData(gnss_.time);
 
     if (nc_extension_enabled_) {
         SensorHealthState previous_horizontal_health;
@@ -2038,7 +2112,6 @@ bool GVINS::gvinsInitializationOptimization() {
     addImuFactors(problem);
 
     solver.Solve(options, &problem, &summary);
-    LOGI << summary.BriefReport();
 
     return summary.termination_type == ceres::CONVERGENCE;
 }
@@ -2065,10 +2138,10 @@ void GVINS::addNewKeyFrameTimeNode() {
         }
 
         // Add new keyframe time node
-        LOGI << "Insert keyframe " << frame->keyFrameId() << " at " << Logging::doubleData(frame->stamp()) << " with "
+        DLOGI << "Insert keyframe " << frame->keyFrameId() << " at " << Logging::doubleData(frame->stamp()) << " with "
              << frame->unupdatedMappoints().size() << " new mappoints";
         map_->insertKeyFrame(frame);
-        LOGI << "Add new keyframe time node at " << Logging::doubleData(frametime);
+        DLOGI << "Add new keyframe time node at " << Logging::doubleData(frametime);
     }
 
     // 移除多余的预积分节点
@@ -2081,7 +2154,7 @@ bool GVINS::removeUnusedTimeNode() {
         return false;
     }
 
-    LOGI << "Remove " << unused_time_nodes_.size() << " unused time node "
+    DLOGI << "Remove " << unused_time_nodes_.size() << " unused time node "
          << Logging::doubleData(unused_time_nodes_[0]);
 
     for (double node : unused_time_nodes_) {
@@ -2147,7 +2220,7 @@ bool GVINS::insertNewGnssTimeNode() {
         }
     }
     if (!is_need_gnss) {
-        LOGI << "Unused GNSS due to non-normal keyframe at " << Logging::doubleData(gnss_.time);
+        DLOGI << "Unused GNSS due to non-normal keyframe at " << Logging::doubleData(gnss_.time);
         return true;
     }
 
@@ -2170,7 +2243,7 @@ bool GVINS::insertNewGnssTimeNode() {
         gnss.std *= 1.2;
 
         gnsslist_.push_back(gnss);
-        LOGI << "Add new GNSS " << Logging::doubleData(gnss_.time) << " align to " << Logging::doubleData(sta);
+        DLOGI << "Add new GNSS " << Logging::doubleData(gnss_.time) << " align to " << Logging::doubleData(sta);
     } else if (end - gnss_.time < MINMUM_SYNC_INTERVAL) {
         // Align to current node
         GNSS gnss = gnss_;
@@ -2187,11 +2260,11 @@ bool GVINS::insertNewGnssTimeNode() {
         gnss.std *= 1.2;
 
         gnsslist_.push_back(gnss);
-        LOGI << "Add new GNSS " << Logging::doubleData(gnss_.time) << " align to " << Logging::doubleData(end);
+        DLOGI << "Add new GNSS " << Logging::doubleData(gnss_.time) << " align to " << Logging::doubleData(end);
     } else {
         // Avoid reintegrating the long-time preintegration
         if (preintegrationlist_[index - 1]->deltaTime() > MAXIMUM_PREINTEGRATION_LENGTH) {
-            LOGI << "Unused GNSS due to long-time preintegration " << Logging::doubleData(gnss_.time);
+            LOGW << "[DROP] unused GNSS due to long-time preintegration " << Logging::doubleData(gnss_.time);
             return true;
         }
 
@@ -2258,7 +2331,7 @@ bool GVINS::insertNewGnssTimeNode() {
 }
 
 bool GVINS::addNewGnssTimeNode() {
-    LOGI << "Add new GNSS time node " << Logging::doubleData(gnss_.time);
+    DLOGI << "Add new GNSS time node " << Logging::doubleData(gnss_.time);
 
     if (!addNewTimeNode(gnss_.time)) {
         LOGW << "Failed to add GNSS time node " << Logging::doubleData(gnss_.time);
@@ -2504,8 +2577,11 @@ bool GVINS::gvinsOutlierCulling() {
         map_->removeMappoint(mappoint);
     }
 
-    LOGI << "Culled " << num_outliers_mappoint << " mappoint with " << num_outliers_feature << " bad observed features "
-         << num1 << ", " << num2 << ", " << num3;
+    if (num_outliers_mappoint > 0 || num_outliers_feature > 0) {
+        LOGW << "[THRESH] visual map culled points=" << num_outliers_mappoint
+             << " bad_features=" << num_outliers_feature
+             << " buckets=" << num1 << "," << num2 << "," << num3;
+    }
     outliers_[0] = num_outliers_mappoint;
     outliers_[1] = num_outliers_feature;
 
@@ -2517,6 +2593,53 @@ bool GVINS::gvinsOptimization() {
     static int second_num_iterations = optimize_num_iterations_ - first_num_iterations;
 
     TimeCost timecost;
+    const int diagnostics_sequence = ++console_diagnostics_sequence_;
+    const bool log_optimization =
+        console_diagnostics_options_.enabled &&
+        (console_diagnostics_options_.window_detail_stride <= 1 ||
+         (diagnostics_sequence % console_diagnostics_options_.window_detail_stride) == 0);
+
+    auto capture_pose_briefs = [&]() {
+        std::vector<nc_diag::PoseBrief> poses;
+        size_t limit = statedatalist_.size();
+        if (console_diagnostics_options_.max_window_slots > 0) {
+            limit = std::min(limit, static_cast<size_t>(console_diagnostics_options_.max_window_slots));
+        }
+        poses.reserve(limit);
+        for (size_t k = 0; k < limit; k++) {
+            poses.push_back(makePoseBrief(statedatalist_[k]));
+        }
+        return poses;
+    };
+
+    auto is_keyframe_time = [&](double time) {
+        for (const auto &keyframe : map_->keyframes()) {
+            if (keyframe.second &&
+                MISC::isTheSameTimeNode(keyframe.second->stamp(), time, MISC::MINIMUM_TIME_INTERVAL)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    nc_diag::OptimizationWindowLog diagnostics_log;
+    if (log_optimization) {
+        diagnostics_log.sequence = diagnostics_sequence;
+        diagnostics_log.time = timelist_.empty() ? 0.0 : timelist_.back();
+        diagnostics_log.state_count = static_cast<int>(statedatalist_.size());
+        diagnostics_log.keyframe_count = static_cast<int>(map_->keyframes().size());
+        diagnostics_log.preintegration_count = static_cast<int>(preintegrationlist_.size());
+        diagnostics_log.before = capture_pose_briefs();
+        diagnostics_log.slots.reserve(diagnostics_log.before.size());
+        for (size_t k = 0; k < diagnostics_log.before.size(); k++) {
+            nc_diag::SlotFactorLog slot;
+            slot.index = static_cast<int>(k);
+            slot.time = diagnostics_log.before[k].time;
+            slot.keyframe = is_keyframe_time(slot.time);
+            slot.imu_to_next = k < preintegrationlist_.size();
+            diagnostics_log.slots.push_back(slot);
+        }
+    }
 
     ceres::Problem::Options problem_options;
     problem_options.enable_fast_removal = true;
@@ -2548,21 +2671,48 @@ bool GVINS::gvinsOptimization() {
     // GNSS残差
     // The GNSS factors
     auto gnss_redisual_block = addGnssFactors(problem, true);
+    if (log_optimization) {
+        diagnostics_log.gnss_factor_count = static_cast<int>(gnss_redisual_block.size());
+    }
 
     // NC-IC extension: calibrated heading is an optional yaw-only external
     // observation and stays dormant for datasets without magnetometer data.
-    addHeadingFactors(problem, true);
+    auto heading_residual_block = addHeadingFactors(problem, true);
+    if (log_optimization) {
+        diagnostics_log.heading_factor_count = static_cast<int>(heading_residual_block.size());
+        for (const auto &block : heading_residual_block) {
+            if (!block.second) {
+                continue;
+            }
+            const int index = getStateDataIndex(block.second->time);
+            if (index >= 0 && static_cast<size_t>(index) < diagnostics_log.slots.size()) {
+                diagnostics_log.slots[static_cast<size_t>(index)].heading_count++;
+            }
+        }
+    }
 
     // 预积分残差
     // The IMU preintegration factors
-    addImuFactors(problem);
+    auto imu_residual_ids = addImuFactors(problem);
 
     // 视觉重投影残差
     // The visual reprojection factors
-    auto residual_ids = addReprojectionFactors(problem, true);
-
-    LOGI << "Add " << preintegrationlist_.size() << " preintegration, " << gnsslist_.size() << " GNSS, "
-         << residual_ids.size() << " reprojection";
+    std::vector<nc_diag::VisualResidualDecision> visual_decisions;
+    auto residual_ids =
+        addReprojectionFactors(problem, true, log_optimization ? &visual_decisions : nullptr);
+    if (log_optimization) {
+        diagnostics_log.visual_factor_count = static_cast<int>(residual_ids.size());
+        for (const auto &decision : visual_decisions) {
+            if (decision.ref_index >= 0 &&
+                static_cast<size_t>(decision.ref_index) < diagnostics_log.slots.size()) {
+                diagnostics_log.slots[static_cast<size_t>(decision.ref_index)].visual_count++;
+            }
+            if (decision.obs_index >= 0 &&
+                static_cast<size_t>(decision.obs_index) < diagnostics_log.slots.size()) {
+                diagnostics_log.slots[static_cast<size_t>(decision.obs_index)].visual_count++;
+            }
+        }
+    }
 
     // 第一次优化
     // The first optimization
@@ -2570,10 +2720,19 @@ bool GVINS::gvinsOptimization() {
         timecost.restart();
 
         solver.Solve(options, &problem, &summary);
-        LOGI << summary.BriefReport();
 
         iterations_[0] = summary.num_successful_steps;
         timecosts_[0]  = timecost.costInMillisecond();
+        if (log_optimization) {
+            diagnostics_log.first_iterations = summary.num_successful_steps;
+            diagnostics_log.first_cost_ms = timecosts_[0];
+            for (size_t k = 0; k < imu_residual_ids.size() && k < diagnostics_log.slots.size(); k++) {
+                double cost = 0.0;
+                problem.EvaluateResidualBlock(imu_residual_ids[k], false, &cost, nullptr, nullptr);
+                diagnostics_log.slots[k].imu_chi2_valid = true;
+                diagnostics_log.slots[k].imu_chi2 = cost * 2.0;
+            }
+        }
     }
 
     // 粗差检测和剔除
@@ -2582,10 +2741,49 @@ bool GVINS::gvinsOptimization() {
         // Remove factors in the final
 
         // Do GNSS outlier culling
-        gnssOutlierCullingByChi2(problem, gnss_redisual_block);
+        std::vector<nc_diag::GnssFactorDecision> gnss_decisions;
+        gnssOutlierCullingByChi2(problem, gnss_redisual_block,
+                                 log_optimization ? &gnss_decisions : nullptr);
+        if (log_optimization) {
+            for (const auto &decision : gnss_decisions) {
+                if (decision.state_index < 0 ||
+                    static_cast<size_t>(decision.state_index) >= diagnostics_log.slots.size()) {
+                    continue;
+                }
+                auto &slot = diagnostics_log.slots[static_cast<size_t>(decision.state_index)];
+                slot.gnss_count++;
+                if (decision.chi2 >= slot.gnss_chi2) {
+                    slot.gnss_chi2 = decision.chi2;
+                    slot.gnss_threshold = decision.threshold;
+                    slot.gnss_scale = decision.scale;
+                }
+                if (decision.reweighted) {
+                    slot.gnss_reweighted = true;
+                    diagnostics_log.gnss_reweighted_count++;
+                }
+            }
+        }
 
         // Remove outlier reprojection factors
-        const int visual_outliers = removeReprojectionFactorsByChi2(problem, residual_ids, 5.991);
+        const int visual_outliers =
+            removeReprojectionFactorsByChi2(problem, residual_ids, 5.991,
+                                            log_optimization ? &visual_decisions : nullptr);
+        if (log_optimization) {
+            diagnostics_log.visual_outlier_count = visual_outliers;
+            for (const auto &decision : visual_decisions) {
+                if (!decision.removed) {
+                    continue;
+                }
+                if (decision.ref_index >= 0 &&
+                    static_cast<size_t>(decision.ref_index) < diagnostics_log.slots.size()) {
+                    diagnostics_log.slots[static_cast<size_t>(decision.ref_index)].visual_outliers++;
+                }
+                if (decision.obs_index >= 0 &&
+                    static_cast<size_t>(decision.obs_index) < diagnostics_log.slots.size()) {
+                    diagnostics_log.slots[static_cast<size_t>(decision.obs_index)].visual_outliers++;
+                }
+            }
+        }
         if (nc_extension_enabled_ && gvinsstate_ >= GVINS_TRACKING_INITIALIZING) {
             VisualQualityReport report;
             report.time = timelist_.back();
@@ -2624,6 +2822,21 @@ bool GVINS::gvinsOptimization() {
                                 report.residual_count, report.outlier_ratio,
                                 decision.health.recovery_samples),
                 report.time);
+            if (console_diagnostics_options_.enabled) {
+                nc_diag::HealthDecisionLine visual_line;
+                visual_line.time = report.time;
+                visual_line.sensor = "VISION";
+                visual_line.previous_state = sensorHealthStateName(previous_visual_health);
+                visual_line.current_state = sensorHealthStateName(decision.health.state);
+                visual_line.accepted = decision.admit;
+                visual_line.innovation = report.outlier_ratio;
+                visual_line.threshold = visual_max_outlier_ratio_;
+                visual_line.recovery_samples = decision.health.recovery_samples;
+                visual_line.reason =
+                    report.valid ? "visual residual count and outlier ratio accepted" : joinReasons(visual_reasons);
+                LOGI << nc_diag::formatHealthDecision(visual_line)
+                     << " residuals=" << report.residual_count;
+            }
             emitHealthStatus(report.time);
         }
 
@@ -2644,10 +2857,13 @@ bool GVINS::gvinsOptimization() {
         timecost.restart();
 
         solver.Solve(options, &problem, &summary);
-        LOGI << summary.BriefReport();
 
         iterations_[1] = summary.num_successful_steps;
         timecosts_[1]  = timecost.costInMillisecond();
+        if (log_optimization) {
+            diagnostics_log.second_iterations = summary.num_successful_steps;
+            diagnostics_log.second_cost_ms = timecosts_[1];
+        }
 
         if (!map_->isMaximumKeframes()) {
             // 进行必要的重积分
@@ -2659,6 +2875,10 @@ bool GVINS::gvinsOptimization() {
     // 更新参数, 必须的
     // Update the parameters from the optimizer
     updateParametersFromOptimizer();
+    if (log_optimization) {
+        diagnostics_log.after = capture_pose_briefs();
+        LOGI << nc_diag::formatOptimizationWindow(diagnostics_log);
+    }
 
     // 移除粗差路标点
     // Remove mappoint and feature outliers
@@ -2668,7 +2888,8 @@ bool GVINS::gvinsOptimization() {
 }
 
 void GVINS::gnssOutlierCullingByChi2(ceres::Problem &problem,
-                                     vector<std::pair<ceres::ResidualBlockId, GNSS *>> &redisual_block) {
+                                     vector<std::pair<ceres::ResidualBlockId, GNSS *>> &redisual_block,
+                                     std::vector<nc_diag::GnssFactorDecision> *decisions) {
     double cost, chi2;
 
     int outliers_counts = 0;
@@ -2687,10 +2908,12 @@ void GVINS::gnssOutlierCullingByChi2(ceres::Problem &problem,
             continue;
         }
         const double chi2_threshold = (dof == 1) ? 3.841 : ((dof == 2) ? 5.991 : 7.815);
+        double scale = 1.0;
+        bool reweighted = false;
         if (chi2 > chi2_threshold) {
 
             // Reweigthed GNSS
-            double scale = sqrt(chi2 / chi2_threshold);
+            scale = sqrt(chi2 / chi2_threshold);
             if (gnss->horizontal_valid) {
                 gnss->std[0] *= scale;
                 gnss->std[1] *= scale;
@@ -2700,23 +2923,38 @@ void GVINS::gnssOutlierCullingByChi2(ceres::Problem &problem,
             }
 
             outliers_counts++;
+            reweighted = true;
+        }
+        if (decisions) {
+            nc_diag::GnssFactorDecision decision;
+            decision.time = gnss->time;
+            decision.state_index = getStateDataIndex(gnss->time);
+            decision.dof = dof;
+            decision.chi2 = chi2;
+            decision.threshold = chi2_threshold;
+            decision.reweighted = reweighted;
+            decision.scale = scale;
+            decisions->push_back(decision);
         }
     }
 
     if (outliers_counts) {
-        LOGI << "Detect " << outliers_counts << " GNSS outliers at " << Logging::doubleData(timelist_.back());
+        LOGW << "[THRESH] GNSS reweighted=" << outliers_counts
+             << " t=" << Logging::doubleData(timelist_.back());
     }
 }
 
 int GVINS::removeReprojectionFactorsByChi2(ceres::Problem &problem, vector<ceres::ResidualBlockId> &residual_ids,
-                                           double chi2) {
+                                           double chi2,
+                                           std::vector<nc_diag::VisualResidualDecision> *visual_decisions) {
     double cost;
     int outlier_features = 0;
 
     // 进行卡方检验, 判定粗差因子, 待全部判定完成再进行移除, 否则会导致错误
     // Judge first and remove later
     vector<ceres::ResidualBlockId> outlier_residual_ids;
-    for (auto &id : residual_ids) {
+    for (size_t k = 0; k < residual_ids.size(); k++) {
+        auto &id = residual_ids[k];
         problem.EvaluateResidualBlock(id, false, &cost, nullptr, nullptr);
 
         // cost带有1/2系数
@@ -2724,6 +2962,9 @@ int GVINS::removeReprojectionFactorsByChi2(ceres::Problem &problem, vector<ceres
         if (cost * 2.0 > chi2) {
             outlier_features++;
             outlier_residual_ids.push_back(id);
+            if (visual_decisions && k < visual_decisions->size()) {
+                (*visual_decisions)[k].removed = true;
+            }
         }
     }
 
@@ -2733,7 +2974,10 @@ int GVINS::removeReprojectionFactorsByChi2(ceres::Problem &problem, vector<ceres
         problem.RemoveResidualBlock(id);
     }
 
-    LOGI << "Remove " << outlier_features << " reprojection factors";
+    if (outlier_features > 0) {
+        LOGW << "[THRESH] visual reprojection removed=" << outlier_features
+             << " chi2=" << chi2;
+    }
 
     return outlier_features;
 }
@@ -2867,7 +3111,7 @@ bool GVINS::gvinsMarginalization() {
 
     double last_time = timelist_[num_marg];
 
-    LOGI << "Marginalize " << num_marg << " states, last time " << Logging::doubleData(last_time);
+    DLOGI << "Marginalize " << num_marg << " states, last time " << Logging::doubleData(last_time);
 
     std::shared_ptr<MarginalizationInfo> marginalization_info = std::make_shared<MarginalizationInfo>();
 
@@ -3321,7 +3565,9 @@ void GVINS::addReprojectionParameters(ceres::Problem &problem) {
     }
 }
 
-vector<ceres::ResidualBlockId> GVINS::addReprojectionFactors(ceres::Problem &problem, bool isusekernel) {
+vector<ceres::ResidualBlockId>
+GVINS::addReprojectionFactors(ceres::Problem &problem, bool isusekernel,
+                              std::vector<nc_diag::VisualResidualDecision> *visual_decisions) {
 
     vector<ceres::ResidualBlockId> residual_ids;
 
@@ -3392,6 +3638,12 @@ vector<ceres::ResidualBlockId> GVINS::addReprojectionFactors(ceres::Problem &pro
                 problem.AddResidualBlock(factor, loss_function, statedatalist_[ref_frame_index].pose,
                                          statedatalist_[obs_frame_index].pose, extrinsic_, invdepth, &extrinsic_[7]);
             residual_ids.push_back(residual_block_id);
+            if (visual_decisions) {
+                nc_diag::VisualResidualDecision decision;
+                decision.ref_index = static_cast<int>(ref_frame_index);
+                decision.obs_index = static_cast<int>(obs_frame_index);
+                visual_decisions->push_back(decision);
+            }
         }
     }
 
@@ -3410,10 +3662,6 @@ int GVINS::getStateDataIndex(double time) {
 }
 
 void GVINS::addStateParameters(ceres::Problem &problem) {
-    LOGI << "Total " << statedatalist_.size() << " pose states from "
-         << Logging::doubleData(statedatalist_.begin()->time) << " to "
-         << Logging::doubleData(statedatalist_.back().time);
-
     for (auto &statedata : statedatalist_) {
         // 位姿
         // Pose
@@ -3425,13 +3673,16 @@ void GVINS::addStateParameters(ceres::Problem &problem) {
     }
 }
 
-void GVINS::addImuFactors(ceres::Problem &problem) {
+vector<ceres::ResidualBlockId> GVINS::addImuFactors(ceres::Problem &problem) {
+    vector<ceres::ResidualBlockId> residual_ids;
     for (size_t k = 0; k < preintegrationlist_.size(); k++) {
         // 预积分因子
         // IMU preintegration factors
         auto factor = new PreintegrationFactor(preintegrationlist_[k]);
-        problem.AddResidualBlock(factor, nullptr, statedatalist_[k].pose, statedatalist_[k].mix,
-                                 statedatalist_[k + 1].pose, statedatalist_[k + 1].mix);
+        auto residual_id =
+            problem.AddResidualBlock(factor, nullptr, statedatalist_[k].pose, statedatalist_[k].mix,
+                                     statedatalist_[k + 1].pose, statedatalist_[k + 1].mix);
+        residual_ids.push_back(residual_id);
     }
 
     // 添加IMU误差约束, 限制过大的误差估计
@@ -3448,6 +3699,7 @@ void GVINS::addImuFactors(ceres::Problem &problem) {
         auto mix_factor = new ImuMixPriorFactor(preintegration_options_, mix_prior_, mix_prior_std_);
         problem.AddResidualBlock(mix_factor, nullptr, statedatalist_[0].mix);
     }
+    return residual_ids;
 }
 
 vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::Problem &problem, bool isusekernel) {
@@ -3503,21 +3755,25 @@ vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::P
     return residual_block;
 }
 
-void GVINS::addHeadingFactors(ceres::Problem &problem, bool isusekernel) {
+vector<std::pair<ceres::ResidualBlockId, HeadingObservation *>>
+GVINS::addHeadingFactors(ceres::Problem &problem, bool isusekernel) {
+    vector<std::pair<ceres::ResidualBlockId, HeadingObservation *>> residual_block;
     if (!use_magnetic_heading_) {
-        return;
+        return residual_block;
     }
     ceres::LossFunction *loss_function = isusekernel ? new ceres::HuberLoss(1.0) : nullptr;
-    for (const auto &heading : headinglist_) {
+    for (auto &heading : headinglist_) {
         int index = getStateDataIndex(heading.time);
         if (index >= 0 && heading.valid && heading.std > 0) {
             // NC-IC extension: only calibrated yaw enters this factor.  Raw
             // magnetometer processing/calibration remains outside IC-GVINS.
             auto factor = new ceres::AutoDiffCostFunction<HeadingFactor, 1, 7>(
                 new HeadingFactor(heading.yaw, heading.std));
-            problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+            auto residual_id = problem.AddResidualBlock(factor, loss_function, statedatalist_[index].pose);
+            residual_block.push_back(std::make_pair(residual_id, &heading));
         }
     }
+    return residual_block;
 }
 
 void GVINS::constructPrior(bool is_zero_velocity) {

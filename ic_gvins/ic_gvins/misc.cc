@@ -257,7 +257,7 @@ void MISC::redoInsMechanization(const IntegrationConfiguration &config, const In
     }
 
     double dt = ins_windows.back().first.time - state.time;
-    LOGI << "Redo INS mechanization at " << Logging::doubleData(state.time) << " to "
+    DLOGI << "Redo INS mechanization at " << Logging::doubleData(state.time) << " to "
          << Logging::doubleData(ins_windows.back().first.time) << " is " << dt << " s";
     if (dt > 1.0) {
         LOGW << "Do INS mechanization with a long time " << dt << " s";
