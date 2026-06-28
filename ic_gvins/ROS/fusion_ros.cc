@@ -22,6 +22,7 @@
 
 #include "fusion_ros.h"
 #include "drawer_rviz.h"
+#include "image_encoding_utils.h"
 
 #include "ic_gvins/common/angle.h"
 #include "ic_gvins/common/gpstime.h"
@@ -41,6 +42,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <csignal>
 #include <memory>
 #include <sstream>
@@ -606,19 +608,59 @@ void FusionROS::headingCallback(const geometry_msgs::PoseWithCovarianceStampedCo
 void FusionROS::imageCallback(const sensor_msgs::ImageConstPtr &imagemsg) {
     Mat image;
 
-    // Copy image data
-    if (imagemsg->encoding == sensor_msgs::image_encodings::MONO8) {
-        image = Mat(static_cast<int>(imagemsg->height), static_cast<int>(imagemsg->width), CV_8UC1);
-        memcpy(image.data, imagemsg->data.data(), imagemsg->height * imagemsg->width);
-    } else if (imagemsg->encoding == sensor_msgs::image_encodings::BGR8) {
-        image = Mat(static_cast<int>(imagemsg->height), static_cast<int>(imagemsg->width), CV_8UC3);
-        memcpy(image.data, imagemsg->data.data(), imagemsg->height * imagemsg->width * 3);
-    } else if (imagemsg->encoding == sensor_msgs::image_encodings::RGB8) {
-        image = Mat(static_cast<int>(imagemsg->height), static_cast<int>(imagemsg->width), CV_8UC3);
-        memcpy(image.data, imagemsg->data.data(), imagemsg->height * imagemsg->width * 3);
-        // NC-IC extension: Tracking's grayscale conversion expects BGR
-        // storage; preserve RGB images' intended channel weights.
-        cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
+    const auto encoding = image_encoding_utils::classifyEncoding(imagemsg->encoding);
+    const int bytes_per_pixel = image_encoding_utils::bytesPerPixel(encoding);
+    if (bytes_per_pixel == 0) {
+        LOGE << "Unsupported image encoding: " << imagemsg->encoding;
+        return;
+    }
+
+    const auto min_step = static_cast<std::size_t>(imagemsg->width) * static_cast<std::size_t>(bytes_per_pixel);
+    const auto required_size = static_cast<std::size_t>(imagemsg->height) * static_cast<std::size_t>(imagemsg->step);
+    if (imagemsg->width == 0 || imagemsg->height == 0 || imagemsg->step < min_step ||
+        imagemsg->data.size() < required_size) {
+        LOGE << "Invalid image message: encoding=" << imagemsg->encoding << ", width=" << imagemsg->width
+             << ", height=" << imagemsg->height << ", step=" << imagemsg->step
+             << ", data_size=" << imagemsg->data.size();
+        return;
+    }
+
+    const int height = static_cast<int>(imagemsg->height);
+    const int width = static_cast<int>(imagemsg->width);
+    auto *data = const_cast<unsigned char *>(imagemsg->data.data());
+
+    if (encoding == image_encoding_utils::EncodingKind::MONO8) {
+        Mat raw(height, width, CV_8UC1, data, imagemsg->step);
+        raw.copyTo(image);
+    } else if (encoding == image_encoding_utils::EncodingKind::BGR8 ||
+               encoding == image_encoding_utils::EncodingKind::RGB8) {
+        Mat raw(height, width, CV_8UC3, data, imagemsg->step);
+        raw.copyTo(image);
+        if (encoding == image_encoding_utils::EncodingKind::RGB8) {
+            // Tracking's grayscale conversion expects BGR storage.
+            cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
+        }
+    } else {
+        Mat raw(height, width, CV_8UC1, data, imagemsg->step);
+        int conversion = cv::COLOR_BayerBG2BGR;
+        switch (encoding) {
+        case image_encoding_utils::EncodingKind::BAYER_BGGR8:
+            conversion = cv::COLOR_BayerBG2BGR;
+            break;
+        case image_encoding_utils::EncodingKind::BAYER_GBRG8:
+            conversion = cv::COLOR_BayerGB2BGR;
+            break;
+        case image_encoding_utils::EncodingKind::BAYER_GRBG8:
+            conversion = cv::COLOR_BayerGR2BGR;
+            break;
+        case image_encoding_utils::EncodingKind::BAYER_RGGB8:
+            conversion = cv::COLOR_BayerRG2BGR;
+            break;
+        default:
+            LOGE << "Unsupported image encoding: " << imagemsg->encoding;
+            return;
+        }
+        cv::cvtColor(raw, image, conversion);
     }
 
     // Time convertion

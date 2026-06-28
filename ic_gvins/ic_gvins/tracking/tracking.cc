@@ -25,6 +25,7 @@
 #include "common/angle.h"
 #include "common/logging.h"
 #include "common/rotation.h"
+#include "tracking/image_size_guard.h"
 
 #include <tbb/tbb.h>
 #include <yaml-cpp/yaml.h>
@@ -106,6 +107,15 @@ double Tracking::calculateHistigram(const Mat &image) {
 
 bool Tracking::preprocessing(Frame::Ptr frame) {
     isnewkeyframe_ = false;
+
+    if (!tracking_utils::isImageSizeCompatible(frame->image().cols, frame->image().rows, camera_->width(),
+                                               camera_->height())) {
+        LOGE << "Skip image frame at " << Logging::doubleData(frame->stamp()) << " because image size "
+             << frame->image().cols << "x" << frame->image().rows << " does not match cam0.resolution "
+             << camera_->width() << "x" << camera_->height()
+             << ". Check the KAIST image_topic and cam0 calibration for this sequence.";
+        return false;
+    }
 
     // 彩色转灰度
     if (frame->image().channels() == 3) {
