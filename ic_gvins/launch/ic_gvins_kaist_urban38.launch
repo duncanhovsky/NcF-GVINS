@@ -1,0 +1,11 @@
+<launch>
+    <include file="$(find ic_gvins)/launch/ic_gvins_kaist.launch">
+        <arg name="configfile" value="$(find ic_gvins)/../config/gvins-kaist-urban38.yaml"/>
+        <arg name="enable_nc_reloc" value="true"/>
+        <arg name="use_kaist_imu_converter" value="true"/>
+        <arg name="raw_imu_topic" value="/imu/data_raw"/>
+        <arg name="imu_topic" value="/imu/data_frd"/>
+        <arg name="gnss_topic" value="/gps/fix"/>
+        <arg name="image_topic" value="/stereo/left/image_raw"/>
+    </include>
+</launch>

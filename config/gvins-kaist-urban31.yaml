@@ -1,41 +1,26 @@
-# NcF-GVINS configuration for KAIST urban38 using the left stereo camera as a
-# monocular input.
-# Source reference:
-#   ncgmvins_ws/src/VINS-Fusion/config/KAIST/kaist_urban38_config.yaml
+# KAIST urban31 preset. Verify camera/IMU calibration before quantitative evaluation.
 
-outputpath: "/home/dyishere/ncf_gvins_ws/output/kaist_urban38/NcF-GVINS"
+outputpath: "/home/dyishere/ncf_gvins_ws/output/kaist_urban31/NcF-GVINS"
 is_make_outputdir: true
 
 sensor_profile:
-    dataset: "KAIST urban38"
+    dataset: "KAIST urban31"
     camera_type: "mono pinhole from stereo left camera"
-    image_rate: 30
+    image_rate: 10
     imu_rate: 100
-    gnss_rate: 10
+    gnss_rate: 5
     magnetic_rate: 15
-    source_vins_noise:
-        acc_n: 0.02
-        gyr_n: 0.003
-        acc_w: 0.005
-        gyr_w: 3.0e-5
+    source_vins_noise: {acc_n: 0.1, gyr_n: 0.1, acc_w: 0.1, gyr_w: 0.1}
 
-initlength: 1
+initlength: 16
 imudatarate: 100
 iswithearth: true
-
 antlever: [-0.25, 0.0, 0.0]
-
-imumodel:
-    arw: 0.3
-    vrw: 0.3
-    gbstd: 100.0
-    abstd: 100.0
-    corrtime: 1.0
-
+imumodel: {arw: 0.2, vrw: 0.2, gbstd: 10.0, abstd: 150.0, corrtime: 1.0}
 isusegnssoutage: false
 gnssoutagetime: 0
 gnssoutageendtime: 0
-gnssthreshold: 15
+gnssthreshold: 150
 
 nc_extension:
     enabled: true
@@ -46,13 +31,12 @@ nc_extension:
     vertical_recovery_confirm_samples: 5
     horizontal_recovery_confirm_duration: 0.5
     vertical_recovery_confirm_duration: 1.0
-    # KAIST urban38 reference config has 10 Hz GNSS.
-    gnss_timeout: 0.5
-    gnss_horizontal_innovation_threshold: 15.0
-    gnss_vertical_innovation_threshold: 30.0
+    gnss_timeout: 3.0
+    gnss_horizontal_innovation_threshold: 150.0
+    gnss_vertical_innovation_threshold: 300.0
     enable_motion_trend_consensus: true
     trend_min_independent_sources: 3
-    trend_horizontal_threshold: 3.0
+    trend_horizontal_threshold: 300.0
     trend_min_horizontal_motion: 0.2
     recovery_constraint_position_std: 0.20
     recovery_constraint_yaw_std_deg: 1.5
@@ -73,10 +57,10 @@ nc_extension:
     heading_innovation_threshold_deg: 20.0
     heading_recovery_confirm_samples: 3
     heading_degraded_covariance_scale: 10.0
-    visual_min_residuals: 20
-    visual_max_outlier_ratio: 0.5
-    vision_degrade_confirm_frames: 2
-    vision_recovery_confirm_frames: 3
+    visual_min_residuals: 200
+    visual_max_outlier_ratio: 100000.0
+    vision_degrade_confirm_frames: 200000
+    vision_recovery_confirm_frames: 2
     vision_degraded_covariance_scale: 5.0
     imu_recovery_confirm_intervals: 5
     imu_degraded_covariance_scale: 25.0
@@ -84,12 +68,10 @@ nc_extension:
     imu_max_specific_force: 0.0
 
 is_use_visualization: true
-
 track_check_histogram: false
 track_min_parallax: 15
 track_max_interval: 0.35
 track_max_features: 200
-
 reprojection_error_std: 1.5
 optimize_windows_size: 10
 optimize_num_iterations: 20
@@ -97,11 +79,10 @@ optimize_estimate_extrinsic: false
 optimize_estimate_td: true
 
 cam0:
-    intrinsic: [816.4022147406, 817.3838856281, 608.8265842758, 266.6886565244, -2.3882017758]
-    distortion: [-0.0500404858, 0.1200121717, -0.0006259806, -0.0011825064, -0.063505208]
+    intrinsic: [816.9037899277, 811.5680382849, 608.5072628169, 263.4759976444]
+    distortion: [-0.0561430278, 0.1395256320, -0.0012155907, -0.0009728139]
     resolution: [1280, 560]
-
-    # Vehicle FLU calibration converted to the GVINS body frame (front-right-down).
     q_b_c: [0.4945228450, 0.4977781973, 0.5055857733, 0.5020428746]
     t_b_c: [1.71239, -0.247401, 0.11589]
     td_b_c: 0.0
+

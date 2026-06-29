@@ -1,13 +1,11 @@
-# NcF-GVINS configuration for KAIST urban38 using the left stereo camera as a
-# monocular input.
-# Source reference:
-#   ncgmvins_ws/src/VINS-Fusion/config/KAIST/kaist_urban38_config.yaml
+# KAIST urban39 preset copied from the local urban38-family calibration.
+# Verify camera/IMU calibration before quantitative evaluation.
 
-outputpath: "/home/dyishere/ncf_gvins_ws/output/kaist_urban38/NcF-GVINS"
+outputpath: "/home/dyishere/ncf_gvins_ws/output/kaist_urban39/NcF-GVINS"
 is_make_outputdir: true
 
 sensor_profile:
-    dataset: "KAIST urban38"
+    dataset: "KAIST urban39"
     camera_type: "mono pinhole from stereo left camera"
     image_rate: 30
     imu_rate: 100
@@ -22,7 +20,6 @@ sensor_profile:
 initlength: 1
 imudatarate: 100
 iswithearth: true
-
 antlever: [-0.25, 0.0, 0.0]
 
 imumodel:
@@ -46,7 +43,6 @@ nc_extension:
     vertical_recovery_confirm_samples: 5
     horizontal_recovery_confirm_duration: 0.5
     vertical_recovery_confirm_duration: 1.0
-    # KAIST urban38 reference config has 10 Hz GNSS.
     gnss_timeout: 0.5
     gnss_horizontal_innovation_threshold: 15.0
     gnss_vertical_innovation_threshold: 30.0
@@ -84,7 +80,6 @@ nc_extension:
     imu_max_specific_force: 0.0
 
 is_use_visualization: true
-
 track_check_histogram: false
 track_min_parallax: 15
 track_max_interval: 0.35
@@ -100,8 +95,7 @@ cam0:
     intrinsic: [816.4022147406, 817.3838856281, 608.8265842758, 266.6886565244, -2.3882017758]
     distortion: [-0.0500404858, 0.1200121717, -0.0006259806, -0.0011825064, -0.063505208]
     resolution: [1280, 560]
-
-    # Vehicle FLU calibration converted to the GVINS body frame (front-right-down).
     q_b_c: [0.4945228450, 0.4977781973, 0.5055857733, 0.5020428746]
     t_b_c: [1.71239, -0.247401, 0.11589]
     td_b_c: 0.0
+
